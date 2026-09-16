@@ -29,6 +29,14 @@ loads use the existing Gloo model group; when an accelerator
 created and tensor leaves stay on device. Unsupported custom containers retain
 the regular object-broadcast behavior.
 
+Configuration, callback results, sample conservation, packing capacities, and
+checkpoint compatibility remain validated at their boundaries. Fixed-group
+snapshots and internally generated tensor descriptors are not revalidated at
+every stage. Payload A2A uses one pickle format without an application-level
+checksum; duplicate received keys and missing/unexpected Constructor payloads
+still fail. All ranks in a job must run the same code version. Runtime errors
+propagate locally without error-synchronization collectives.
+
 There is no metadata-only streaming mode. Passing only `metadata` (including
 Dataset-inferred metadata) without `batch_sampler` fails at build time.
 Passing only `metadata_fn` without a sampler or external step source also fails.

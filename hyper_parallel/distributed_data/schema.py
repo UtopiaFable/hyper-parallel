@@ -420,10 +420,7 @@ class DistributedPackingPlan:
     @property
     def local_batch_size(self) -> int:
         """Return the number of packed sequences per target rank."""
-        size = len(self.local_batches[0])
-        if any(len(local_batch) != size for local_batch in self.local_batches):
-            raise ValueError("DistributedPackingPlan local batches must have equal sizes.")
-        return size
+        return len(self.local_batches[0])
 
     def _validate_local_batches(self) -> list[SampleKey]:
         keys = []

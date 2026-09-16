@@ -22,6 +22,7 @@ from torch.distributed.device_mesh import init_device_mesh
 
 from hyper_parallel.distributed_data import (
     DistributedDatasetConfig, SampleMetadata, WorkloadCost, build_distributed_dataloader,
+    build_local_balancing_dataloader,
 )
 from hyper_parallel.distributed_data.schema import BufferedSampleMetadata, SampleKey
 
@@ -157,6 +158,43 @@ def _run_steps(mesh, reader_ranks, double_buffer):
     resumed.wait_for_prefetch()
 
 
+def _run_local_steps(double_buffer: bool) -> None:
+    """Exercise the shared codec through locality-scoped moved and retained steps."""
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    mesh = init_device_mesh("cpu", (world_size,), mesh_dim_names=("dp",))
+    steps = [
+        [[{"id": step * world_size * 2 + rank * 2 + ordinal,
+           "cost": 9 if step == 0 and rank == 0 else 1} for ordinal in range(2)]]
+        for step in range(2)
+    ]
+    loader = build_local_balancing_dataloader(
+        steps, mesh,
+        DistributedDatasetConfig(seq_len=10, local_batch_size=1, double_buffer=double_buffer),
+        metadata_fn=lambda sample: SampleMetadata(5, cost=WorkloadCost(llm=sample["cost"])),
+        pack_fn=lambda samples, _seq_len: tuple(samples),
+        collate_fn=tuple,
+        node_id="test-node",
+        enable_balancing=True,
+        communication_device="cpu",
+        max_steps=2,
+        balance_stats_callback=None,
+    )
+    try:
+        for step in range(2):
+            batch = next(loader)
+            outputs = _gather(batch)
+            actual = sorted(sample["id"] for output in outputs for packing_bin in output for sample in packing_bin)
+            expected = list(range(step * world_size * 2, (step + 1) * world_size * 2))
+            assert actual == expected, f"Local balancing changed membership: {actual} != {expected}"
+            assert all(len(output) == 1 and len(output[0]) == 2 for output in outputs), outputs
+            stats = dict(loader.last_balance_stats)
+            moved = stats["moved_samples"]
+            assert (moved > 0) == (step == 0), f"Unexpected movement at step {step}: {moved}"
+    finally:
+        loader.close()
+
+
 def test_dynamic_packing_dp2_mp2_gloo() -> None:
     """Run producer-defined steps on Constructor-owned and separate Reader ranks."""
     dist.init_process_group("gloo", timeout=timedelta(seconds=60))
@@ -174,5 +212,7 @@ def test_dynamic_packing_dp2_mp2_gloo() -> None:
         for reader_ranks in ((0, 2), (1, 3)):
             for double_buffer in (False, True):
                 _run_steps(mesh, reader_ranks, double_buffer)
+        for double_buffer in (False, True):
+            _run_local_steps(double_buffer)
     finally:
         dist.destroy_process_group()

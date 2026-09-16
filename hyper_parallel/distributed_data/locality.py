@@ -126,12 +126,10 @@ def create_locality_groups(
     if distributed:
         statuses = [None] * world_size
         dist.all_gather_object(statuses, status)
-    for expected_rank, entry in enumerate(statuses):
-        if not isinstance(entry, tuple) or len(entry) != 4 or entry[0] != expected_rank:
-            raise ValueError("Local balancing received an invalid WORLD startup status.")
+    for entry in statuses:
         if entry[1] is not None:
             raise ValueError(f"Local balancing build failed on rank {entry[0]}: {entry[1]}")
-    if topology is None or any(entry[2] != identity for entry in statuses):
+    if any(entry[2] != identity for entry in statuses):
         raise ValueError("Local balancing configuration or root mesh differs across WORLD ranks.")
     rank_groups = _scope_rank_groups(topology, balancing_scope, {entry[0]: entry[3] for entry in statuses})
     own_groups = None
@@ -145,8 +143,6 @@ def create_locality_groups(
             )
         if rank in ranks:
             own_groups = DataGroups(ranks, control_group, payload_group, None, min(ranks), distributed)
-    if own_groups is None:
-        raise ValueError(f"Local balancing did not assign rank {rank} to an exchange domain.")
     return topology, own_groups
 
 

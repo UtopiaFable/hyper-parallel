@@ -95,18 +95,15 @@ class PackingDataConstructor:
         Returns:
             User-collated rank-local batch.
         """
-        if not isinstance(plan, Sequence) or isinstance(plan, (str, bytes)):
-            raise ValueError(f"plan must be a sequence of PackingBinPlan values, but got {type(plan)}.")
-        if any(not isinstance(packing_bin, PackingBinPlan) for packing_bin in plan):
-            raise ValueError("plan must contain PackingBinPlan values.")
         expected_keys = tuple(
             key
             for packing_bin in plan
             for key in packing_bin.sample_keys
         )
-        if len(payloads) != len(expected_keys) or set(payloads) != set(expected_keys):
-            missing = set(expected_keys) - set(payloads)
-            unexpected = set(payloads) - set(expected_keys)
+        expected_set = set(expected_keys)
+        if len(payloads) != len(expected_keys) or payloads.keys() != expected_set:
+            missing = expected_set - payloads.keys()
+            unexpected = payloads.keys() - expected_set
             raise ValueError(
                 f"Data Constructor payload keys do not match the plan; "
                 f"missing={sorted(missing)}, unexpected={sorted(unexpected)}."

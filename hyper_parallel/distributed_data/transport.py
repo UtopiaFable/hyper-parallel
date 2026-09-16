@@ -17,7 +17,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import pickle
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
@@ -27,10 +26,6 @@ import torch.distributed as dist  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.distributed_data.schema import SampleKey
 from hyper_parallel.distributed_data.topology import DataTopology
-
-_FRAME_MAGIC = b"HPDDP1"
-_DIGEST_SIZE = 32
-
 
 @dataclass(frozen=True)
 class DataGroups:
@@ -47,7 +42,7 @@ class DataGroups:
 
 @dataclass(frozen=True)
 class PreparedPayloadExchange:
-    """Preflighted Host frame and collective tensor for one payload A2A."""
+    """Serialized host payload and collective tensor for one payload A2A."""
 
     input_splits: tuple[int, ...]
     send_storage: bytearray
@@ -112,16 +107,15 @@ def synchronize_build_preflight(
 
     gathered = [None] * dist.get_world_size()
     dist.all_gather_object(gathered, status)
-    normalized = _normalize_build_statuses(gathered)
-    _validate_build_errors_and_fingerprint(normalized)
-    _validate_build_modes(normalized)
-    dataset_reader_sizes = [(item[0], item[3]) for item in normalized if item[2]]
+    _validate_build_errors_and_fingerprint(gathered)
+    _validate_build_modes(gathered)
+    dataset_reader_sizes = [(item[0], item[3]) for item in gathered if item[2]]
     _validate_dataset_reader_sizes(
         dataset_reader_sizes,
         metadata_mode=metadata_mode,
         dataset_already_sharded=dataset_already_sharded,
     )
-    direct_reader_sizes = [(item[0], item[5]) for item in normalized if item[4]]
+    direct_reader_sizes = [(item[0], item[5]) for item in gathered if item[4]]
     _validate_direct_reader_sizes(direct_reader_sizes, dataset_already_sharded=dataset_already_sharded)
     _validate_metadata_size_alignment(
         dataset_reader_sizes,
@@ -129,19 +123,10 @@ def synchronize_build_preflight(
         metadata_mode=metadata_mode,
         dataset_already_sharded=dataset_already_sharded,
     )
-    reader_modes = {item[9] for item in normalized if item[2]}
+    reader_modes = {item[9] for item in gathered if item[2]}
     if len(reader_modes) > 1:
         raise ValueError("Distributed DataLoader external step mode differs across Dataset Readers.")
     return True in reader_modes
-
-
-def _normalize_build_statuses(gathered: Sequence[Any]) -> tuple[tuple[Any, ...], ...]:
-    normalized = []
-    for expected_rank, item in enumerate(gathered):
-        if not isinstance(item, tuple) or len(item) != 10 or item[0] != expected_rank:
-            raise ValueError("Distributed DataLoader build preflight received an invalid WORLD status.")
-        normalized.append(item)
-    return tuple(normalized)
 
 
 def _validate_build_errors_and_fingerprint(normalized: Sequence[tuple[Any, ...]]) -> None:
@@ -437,46 +422,18 @@ def _create_model_parallel_process_groups(
     return model_parallel_group, model_parallel_tensor_group
 
 
-def _encode_payload_segment(items: Sequence[tuple[SampleKey, Any]], *, validate: bool = True) -> bytes:
-    """Serialize one target route, optionally with integrity validation."""
+def _encode_payload_segment(items: Sequence[tuple[SampleKey, Any]]) -> bytes:
+    """Serialize an internal route; the collective backend transports its bytes."""
     if not items:
         return b""
-    if not validate:
-        return pickle.dumps(tuple(items), protocol=pickle.HIGHEST_PROTOCOL)
-    keys = [key for key, _ in items]
-    if any(not isinstance(key, SampleKey) for key in keys) or len(keys) != len(set(keys)):
-        raise ValueError("A payload segment must contain unique SampleKey values.")
-    payload = pickle.dumps(tuple(items), protocol=pickle.HIGHEST_PROTOCOL)
-    digest = hashlib.sha256(payload).digest()
-    return _FRAME_MAGIC + digest + payload
+    return pickle.dumps(tuple(items), protocol=pickle.HIGHEST_PROTOCOL)
 
 
-def _decode_payload_segment(frame: bytes, *, validate: bool = True) -> tuple[tuple[SampleKey, Any], ...]:
-    """Deserialize one target route using its selected validation mode."""
+def _decode_payload_segment(frame: bytes) -> tuple[tuple[SampleKey, Any], ...]:
+    """Deserialize a route produced by peers running the same codec."""
     if not frame:
         return ()
-    if not validate:
-        return pickle.loads(frame)
-    header_size = len(_FRAME_MAGIC) + _DIGEST_SIZE
-    if len(frame) < header_size or frame[:len(_FRAME_MAGIC)] != _FRAME_MAGIC:
-        raise ValueError("Distributed sample payload has an invalid frame header.")
-    expected_digest = frame[len(_FRAME_MAGIC):header_size]
-    payload = frame[header_size:]
-    if hashlib.sha256(payload).digest() != expected_digest:
-        raise ValueError("Distributed sample payload checksum mismatch.")
-    try:
-        items = pickle.loads(payload)
-    except Exception as exc:
-        raise ValueError(f"Distributed sample payload cannot be decoded: {exc}") from exc
-    if not isinstance(items, tuple) or any(
-            not isinstance(item, tuple) or len(item) != 2 or not isinstance(item[0], SampleKey)
-            for item in items
-    ):
-        raise ValueError("Distributed sample payload contains an invalid route segment.")
-    keys = [key for key, _ in items]
-    if len(keys) != len(set(keys)):
-        raise ValueError("Distributed sample payload contains duplicate SampleKey values.")
-    return items
+    return pickle.loads(frame)
 
 
 def _encode_model_batch(value: Any) -> tuple[Any, list[torch.Tensor]]:
@@ -501,14 +458,9 @@ def _encode_model_batch(value: Any) -> tuple[Any, list[torch.Tensor]]:
 
 def _decode_model_batch(schema: Any, tensors: Sequence[torch.Tensor]) -> Any:
     """Reconstruct a batch from a broadcast structure and tensor leaves."""
-    if not isinstance(schema, tuple) or not schema:
-        raise ValueError("Model batch broadcast received an invalid structure descriptor.")
     kind = schema[0]
     if kind == "__hp_tensor__":
-        index = schema[1]
-        if not isinstance(index, int) or index < 0 or index >= len(tensors):
-            raise ValueError(f"Model batch tensor descriptor has invalid index {index!r}.")
-        return tensors[index]
+        return tensors[schema[1]]
     if kind == "__hp_mapping__":
         return {key: _decode_model_batch(child, tensors) for key, child in schema[1]}
     if kind == "__hp_tuple__":
@@ -522,13 +474,9 @@ def _decode_model_batch(schema: Any, tensors: Sequence[torch.Tensor]) -> Any:
 
 def _tensor_specs(schema: Any) -> list[tuple[tuple[int, ...], torch.dtype, str]]:
     """Collect tensor descriptors in the same order used by the encoder."""
-    if not isinstance(schema, tuple) or not schema:
-        raise ValueError("Model batch broadcast received an invalid structure descriptor.")
     kind = schema[0]
     if kind == "__hp_tensor__":
-        if len(schema) != 5 or not isinstance(schema[1], int):
-            raise ValueError("Model batch broadcast received an invalid tensor descriptor.")
-        return [(tuple(schema[2]), schema[3], schema[4])]
+        return [(schema[2], schema[3], schema[4])]
     if kind == "__hp_mapping__":
         children = (child for _, child in schema[1])
     elif kind in ("__hp_tuple__", "__hp_list__"):
@@ -571,48 +519,29 @@ def _exchange_payload_sizes(input_splits: Sequence[int], control_group: Any) -> 
     return [int(size) for size in size_output.tolist()]
 
 
-def _allocate_received_tensor(
-        output_splits: Sequence[int],
-        send_tensor: torch.Tensor,
-        expected_split_count: int,
-) -> torch.Tensor:
-    try:
-        if len(output_splits) != expected_split_count or any(size < 0 for size in output_splits):
-            raise ValueError(f"Sample all-to-all returned invalid payload sizes {list(output_splits)}.")
-        return torch.empty(
-            (sum(output_splits),),
-            dtype=torch.uint8,
-            device=send_tensor.device,
-        )
-    except Exception as exc:
-        raise ValueError(f"Payload receive allocation failed: {type(exc).__name__}: {exc}") from exc
-
-
 def _decode_received_payloads(
         received_bytes: bytes,
         output_splits: Sequence[int],
-        *,
-        validate: bool = True,
 ) -> dict[SampleKey, Any]:
+    """Merge routes without silently overwriting duplicate sample occurrences."""
     payloads: dict[SampleKey, Any] = {}
     cursor = 0
     for segment_size in output_splits:
-        segment_items = _decode_payload_segment(received_bytes[cursor:cursor + segment_size], validate=validate)
-        if validate:
-            for key, payload in segment_items:
-                if key in payloads:
-                    raise ValueError(f"Data Constructor received duplicate payload for {key}.")
-                payloads[key] = payload
-        else:
-            payloads.update(segment_items)
+        segment_items = _decode_payload_segment(received_bytes[cursor:cursor + segment_size])
+        for key, payload in segment_items:
+            if key in payloads:
+                raise ValueError(f"Data Constructor received duplicate payload for {key}.")
+            payloads[key] = payload
         cursor += segment_size
-    if validate and cursor != len(received_bytes):
-        raise ValueError("Sample all-to-all returned trailing payload bytes.")
     return payloads
 
 
 class DataPlaneTransport:
-    """Metadata/control collectives and variable-byte sample all-to-all."""
+    """Metadata/control collectives and variable-byte sample all-to-all.
+
+    The coordinator calls these methods only on data-plane members. Group
+    topology is fixed at build time; it is not revalidated for each collective.
+    """
 
     def __init__(self, groups: DataGroups, global_rank: int, communication_device: Any = None) -> None:
         """Store service-group membership."""
@@ -620,9 +549,11 @@ class DataPlaneTransport:
         self._control_group = groups.control_group
         self._payload_group = groups.payload_group
         self._planner_rank = groups.planner_rank
-        self._distributed = groups.distributed
         self._global_rank = global_rank
         self._is_member = global_rank in self._ranks
+        self._local_index = self._ranks.index(global_rank) if self._is_member else None
+        if self._is_member and len(self._ranks) > 1 and (not groups.distributed or self._control_group is None):
+            raise ValueError("Multi-rank data-plane communication requires an initialized process group.")
         self._communication_device = (
             torch.device(communication_device) if communication_device is not None else None
         )
@@ -647,18 +578,15 @@ class DataPlaneTransport:
         """Return the rank-local accelerator used by payload collectives."""
         return self._communication_device
 
-    def all_gather_object(self, value: Any, *, validate: bool = True) -> tuple[Any, ...]:
+    def all_gather_object(self, value: Any) -> tuple[Any, ...]:
         """Gather small control objects on every data-plane rank.
 
         Args:
             value: Rank-local control value.
-            validate: Whether to check process-group membership before gathering.
 
         Returns:
             Values in data-plane rank order.
         """
-        if validate:
-            self._require_member()
         if len(self._ranks) == 1:
             return (value,)
         gathered = [None] * len(self._ranks)
@@ -667,9 +595,6 @@ class DataPlaneTransport:
 
     def all_ranks_true(self, value: bool) -> bool:
         """Return whether every data-plane rank supplied ``True``."""
-        self._require_member()
-        if not isinstance(value, bool):
-            raise ValueError("all_ranks_true expects a boolean value.")
         if len(self._ranks) == 1:
             return value
         flag = torch.tensor([int(value)], dtype=torch.int32, device="cpu")
@@ -685,10 +610,7 @@ class DataPlaneTransport:
         Returns:
             Gathered values on the Planner rank, otherwise ``None``.
         """
-        self._require_member()
         if len(self._ranks) == 1:
-            if self._global_rank != self._planner_rank:
-                raise ValueError("A singleton data plane must contain the Planner rank.")
             return (value,)
         gathered = [None] * len(self._ranks) if self._global_rank == self._planner_rank else None
         dist.gather_object(
@@ -699,21 +621,16 @@ class DataPlaneTransport:
         )
         return tuple(gathered) if gathered is not None else None
 
-    def broadcast_from_planner(self, value: Any, *, validate: bool = True) -> Any:
+    def broadcast_from_planner(self, value: Any) -> Any:
         """Broadcast one control object from the configured Planner.
 
         Args:
             value: Planner value or a placeholder on other ranks.
-            validate: Whether to check process-group and singleton planner membership.
 
         Returns:
             The Planner value on every data-plane rank.
         """
-        if validate:
-            self._require_member()
         if len(self._ranks) == 1:
-            if validate and self._global_rank != self._planner_rank:
-                raise ValueError("A singleton data plane must contain the Planner rank.")
             return value
         payload = [value if self._global_rank == self._planner_rank else None]
         dist.broadcast_object_list(payload, src=self._planner_rank, group=self._control_group)
@@ -722,25 +639,19 @@ class DataPlaneTransport:
     def prepare_exchange(
             self,
             outgoing: Mapping[int, Sequence[tuple[SampleKey, Any]]],
-            *,
-            validate: bool = True,
     ) -> PreparedPayloadExchange:
         """Serialize and allocate the send buffer before collective entry.
 
         Args:
             outgoing: Per-target sample keys and payloads.
-            validate: Whether to check routes and frame payloads with a checksum.
-                Must match ``exchange_prepared`` on all participating ranks.
 
         Returns:
             Serialized payload splits and their send tensor.
         """
-        if validate:
-            self._require_member()
-            unexpected = set(outgoing) - set(self._ranks)
-            if unexpected:
-                raise ValueError(f"Payload routes target ranks outside the data plane: {sorted(unexpected)}.")
-        segments = tuple(_encode_payload_segment(outgoing.get(rank, ()), validate=validate) for rank in self._ranks)
+        unexpected = outgoing.keys() - self._ranks
+        if unexpected:
+            raise ValueError(f"Payload routes target ranks outside the data plane: {sorted(unexpected)}.")
+        segments = tuple(_encode_payload_segment(outgoing.get(rank, ())) for rank in self._ranks)
         input_splits = tuple(len(segment) for segment in segments)
         send_storage = bytearray(sum(input_splits))
         cursor = 0
@@ -753,54 +664,37 @@ class DataPlaneTransport:
             send_tensor = torch.empty((0,), dtype=torch.uint8)
         if self._communication_device is not None:
             send_tensor = send_tensor.to(self._communication_device)
-        local_index = self._ranks.index(self._global_rank)
         return PreparedPayloadExchange(
             input_splits=input_splits,
             send_storage=send_storage,
             send_tensor=send_tensor,
-            local_segment=segments[local_index],
+            local_segment=segments[self._local_index],
         )
 
     def exchange_prepared(
             self,
             prepared: PreparedPayloadExchange,
-            *,
-            validate: bool = True,
     ) -> dict[SampleKey, Any]:
         """Exchange serialized sample payloads with variable-split payload A2A.
 
         Args:
             prepared: Preallocated payload exchange state.
-            validate: Whether to validate routing, payloads, and receive
-                allocation sizes. Must match ``prepare_exchange`` on all ranks.
-                Local failures propagate without notifying peers.
 
         Returns:
             Received payloads keyed by their source identities.
         """
-        if validate:
-            self._require_member()
-            if not isinstance(prepared, PreparedPayloadExchange) or len(prepared.input_splits) != len(self._ranks):
-                raise ValueError(f"Expected a prepared exchange for {len(self._ranks)} data-plane ranks.")
         if len(self._ranks) == 1:
-            return dict(_decode_payload_segment(prepared.local_segment, validate=validate))
-        if validate and self._payload_group is None:
+            return _decode_received_payloads(prepared.local_segment, prepared.input_splits)
+        if self._payload_group is None:
             raise ValueError("Sample payload exchange requires a payload process group.")
 
         input_splits = list(prepared.input_splits)
         output_splits = _exchange_payload_sizes(input_splits, self._control_group)
-        if validate:
-            received_tensor = _allocate_received_tensor(
-                output_splits,
-                prepared.send_tensor,
-                len(self._ranks),
-            )
-        else:
-            received_tensor = torch.empty(
-                (sum(output_splits),),
-                dtype=torch.uint8,
-                device=prepared.send_tensor.device,
-            )
+        received_tensor = torch.empty(
+            (sum(output_splits),),
+            dtype=torch.uint8,
+            device=prepared.send_tensor.device,
+        )
         data_work = dist.all_to_all_single(
             received_tensor,
             prepared.send_tensor,
@@ -812,13 +706,7 @@ class DataPlaneTransport:
         if data_work is not None:
             data_work.wait()
         received_bytes = received_tensor.cpu().numpy().tobytes()
-        return _decode_received_payloads(received_bytes, output_splits, validate=validate)
-
-    def _require_member(self) -> None:
-        if not self._is_member:
-            raise ValueError(f"Global rank {self._global_rank} is not a data-plane member.")
-        if len(self._ranks) > 1 and (not self._distributed or self._control_group is None):
-            raise ValueError("Multi-rank data-plane communication requires an initialized process group.")
+        return _decode_received_payloads(received_bytes, output_splits)
 
 
 class ModelParallelTransport:
@@ -831,7 +719,8 @@ class ModelParallelTransport:
         self._accelerator_tensor_group = groups.model_parallel_tensor_group
         self._constructor_rank = topology.constructor_rank
         self._global_rank = topology.global_rank
-        self._distributed = groups.distributed
+        if len(self._ranks) > 1 and (not groups.distributed or self._object_group is None):
+            raise ValueError("Multi-rank model broadcast requires an initialized process group.")
 
     def broadcast(self, batch: Any) -> Any:
         """Return the constructor's batch data on every model-parallel peer.
@@ -848,31 +737,19 @@ class ModelParallelTransport:
         """
         is_constructor = self._global_rank == self._constructor_rank
         if len(self._ranks) == 1:
-            if not is_constructor:
-                raise ValueError("A singleton model group requires the Data Constructor rank.")
             return batch
-        if not self._distributed or self._object_group is None:
-            raise ValueError("Multi-rank model broadcast requires an initialized process group.")
-        if not is_constructor and batch is not None:
-            raise ValueError("Only the Data Constructor may provide the model-group batch.")
         schema, source_tensors = _encode_model_batch(batch) if is_constructor else (None, [])
         payload = [schema]
         dist.broadcast_object_list(payload, src=self._constructor_rank, group=self._object_group)
-        if not isinstance(payload[0], tuple):
-            raise ValueError("Model batch broadcast received an invalid structure descriptor.")
         tensor_specs = _tensor_specs(payload[0])
-        if is_constructor:
-            for spec in tensor_specs:
-                _tensor_device(spec[2], self._group_for_tensor(spec[2]))
         received_tensors = []
         for index, spec in enumerate(tensor_specs):
             tensor_group = self._group_for_tensor(spec[2])
+            device = _tensor_device(spec[2], tensor_group)
             if is_constructor:
                 tensor = source_tensors[index]
-                if tuple(tensor.shape) != spec[0] or tensor.dtype != spec[1]:
-                    raise ValueError("Model batch tensor metadata changed during broadcast.")
             else:
-                tensor = torch.empty(spec[0], dtype=spec[1], device=_tensor_device(spec[2], tensor_group))
+                tensor = torch.empty(spec[0], dtype=spec[1], device=device)
             dist.broadcast(tensor, src=self._constructor_rank, group=tensor_group)
             received_tensors.append(tensor)
         return batch if is_constructor else _decode_model_batch(payload[0], received_tensors)

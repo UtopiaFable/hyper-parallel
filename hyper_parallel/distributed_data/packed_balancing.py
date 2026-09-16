@@ -287,7 +287,7 @@ class LocalBalancingDataLoader:
                 self._pack_fn(raw_bin, self.config.seq_len) for raw_bin in raw_bins
             ]))
         metadata, local_payloads = self._read_step(raw_bins, step)
-        gathered = self._transport.all_gather_object(metadata, validate=False)
+        gathered = self._transport.all_gather_object(metadata)
         plan, stats = self._plan_step(gathered, step)
         if stats["moved_samples"]:
             outgoing: dict[int, list[tuple[SampleKey, Any]]] = {}
@@ -304,8 +304,8 @@ class LocalBalancingDataLoader:
                     retained_payloads.update(owned)
                 else:
                     outgoing[target_rank] = owned
-            prepared = self._transport.prepare_exchange(outgoing, validate=False)
-            received = self._transport.exchange_prepared(prepared, validate=False)
+            prepared = self._transport.prepare_exchange(outgoing)
+            received = self._transport.exchange_prepared(prepared)
             received.update(retained_payloads)
         else:
             # Every rank sees the same plan and skips an unchanged exchange.
@@ -351,7 +351,7 @@ class LocalBalancingDataLoader:
             if self._global_rank == 0:
                 stats.update(self._bin_statistics(gathered, plan))
             result = (plan, stats)
-        return self._transport.broadcast_from_planner(result, validate=False)
+        return self._transport.broadcast_from_planner(result)
 
     def _bin_statistics(self, gathered: Sequence[Any], plan: DistributedPackingPlan) -> dict[str, Any]:
         """Summarize original and accepted bins on the planner, reusing gathered metadata."""

@@ -191,7 +191,8 @@ class DynamicPackingPlanner:
             seq_len=self.seq_len,
             local_batches=local_batches,
             rank_costs=tuple(rank_costs),
-            validate=self._validate,
+            # Placement enforces capacities; conservation was checked above.
+            validate=False,
         )
 
     def _estimate_selection(self, selection: StepSampleSelection) -> StepSampleSelection:
@@ -343,9 +344,11 @@ class DynamicPackingPlanner:
             for packing_bin in local_batch
             for key in packing_bin.sample_keys
         )
-        if len(planned_keys) != len(set(planned_keys)) or set(planned_keys) != set(selected_keys):
-            missing = sorted(set(selected_keys) - set(planned_keys))
-            unexpected = sorted(set(planned_keys) - set(selected_keys))
+        planned_set = set(planned_keys)
+        selected_set = set(selected_keys)
+        if len(planned_keys) != len(planned_set) or planned_set != selected_set:
+            missing = sorted(selected_set - planned_set)
+            unexpected = sorted(planned_set - selected_set)
             raise ValueError(
                 "Balanced placement must conserve the frozen step sample set exactly; "
                 f"missing={missing}, unexpected={unexpected}."
@@ -430,7 +433,7 @@ class DynamicPackingPlanner:
                     sample_keys=tuple(item.key for item in packing_bin.samples),
                     pack_tokens=packing_bin.pack_tokens,
                     oversized=packing_bin.oversized,
-                    validate=self._validate,
+                    validate=False,
                 ))
             local_batches.append(tuple(rank_bins))
         return tuple(local_batches)

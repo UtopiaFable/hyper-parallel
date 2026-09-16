@@ -148,7 +148,7 @@ class DistributedDataLoader(Iterator[Any]):
             double_buffer=double_buffer,
         )
         self._topology = topology
-        self._dataset_reader_ranks = dataset_reader_ranks
+        self._dataset_reader_ranks = frozenset(dataset_reader_ranks)
         self._dataset_reader = dataset_reader
         self._metadata_reader = metadata_reader
         self._direct_sample_loader = direct_sample_loader
@@ -217,9 +217,6 @@ class DistributedDataLoader(Iterator[Any]):
             self._pending_local_keys.clear()
             self._pending_plan = None
             raise StopIteration
-        if self._data_plane.is_member and self._pending_plan is None:
-            raise ValueError("Received an active batch without a pending distributed packing plan.")
-
         # Dataset Reader buffers are committed only after construction and broadcast
         # have both succeeded, leaving checkpoint boundaries unambiguous.
         planning_reader = self._planning_reader()
@@ -507,14 +504,9 @@ class DistributedDataLoader(Iterator[Any]):
         if plan is None:
             return None
 
-        if plan.step != self._step:
-            raise ValueError(
-                f"Planner returned step {plan.step}, but this rank expects step {self._step}."
-            )
         self._pending_plan = plan
-        selected_keys = set(plan.selected_keys)
         local_selected_keys = {
-            key for key in selected_keys if key.reader_rank == self._topology.global_rank
+            key for key in plan.selected_keys if key.reader_rank == self._topology.global_rank
         }
         self._pending_local_keys = local_selected_keys
         if self._metadata_mode:
@@ -545,8 +537,6 @@ class DistributedDataLoader(Iterator[Any]):
         """Directly read constructor-assigned shared indices without payload A2A."""
         received_payloads: dict[SampleKey, Any] = {}
         if self._topology.is_constructor:
-            if self._direct_sample_loader is None:
-                raise ValueError("A metadata Data Constructor has no plan-aware sample loader.")
             received_payloads = self._direct_sample_loader.fetch(
                 plan.local_sample_keys(self._topology.data_rank)
             )
@@ -558,16 +548,10 @@ class DistributedDataLoader(Iterator[Any]):
             received_payloads: dict[SampleKey, Any],
     ) -> Any:
         """Construct one local batch and return it on the Data Constructor rank."""
-        local_batch = None
-        if self._topology.is_constructor:
-            local_batch_plan = plan.local_batch_for(self._topology.data_rank)
-            local_batch = self._data_constructor.construct(local_batch_plan, received_payloads)
-        elif received_payloads:
-            raise ValueError(
-                f"Non-constructor rank {self._topology.global_rank} received unexpected sample payloads."
-            )
         if not self._topology.is_constructor:
             return None
+        local_batch_plan = plan.local_batch_for(self._topology.data_rank)
+        local_batch = self._data_constructor.construct(local_batch_plan, received_payloads)
         return self._require_batch(local_batch)
 
     @staticmethod
@@ -583,8 +567,6 @@ class DistributedDataLoader(Iterator[Any]):
         snapshots = self._data_plane.gather_object_to_planner(local_snapshot)
         plan = None
         if self._topology.global_rank == self._data_plane.planner_rank:
-            if snapshots is None:
-                raise RuntimeError("Planner did not receive Dataset Reader snapshots.")
             plan = self._build_plan_control(snapshots)
         return self._data_plane.broadcast_from_planner(plan)
 
@@ -598,9 +580,6 @@ class DistributedDataLoader(Iterator[Any]):
                 original_metadatas=(),
             )
         planning_reader = self._planning_reader()
-        if planning_reader is None:
-            raise ValueError(f"Dataset Reader rank {self._topology.global_rank} did not provide its reader.")
-
         # Step sources own membership; token targets must not pull a future step.
         planning_reader.prepare_next_step()
         original_metadatas = getattr(planning_reader, "original_metadatas", None)
@@ -613,36 +592,11 @@ class DistributedDataLoader(Iterator[Any]):
             original_metadatas=tuple(original_metadatas),
         )
 
-    def _build_plan_control(self, snapshots: tuple[Any, ...]) -> DistributedPackingPlan | None:
+    def _build_plan_control(self, snapshots: tuple[_ReaderSnapshot, ...]) -> DistributedPackingPlan | None:
         """Return the current step's plan; None means end of stream."""
-        normalized = self._normalize_reader_snapshots(snapshots)
-        return self._plan_reader_snapshots(normalized)
-
-    def _normalize_reader_snapshots(
-            self,
-            snapshots: tuple[Any, ...],
-    ) -> tuple[_ReaderSnapshot, ...]:
-        normalized = []
-        for snapshot in snapshots:
-            if not isinstance(snapshot, _ReaderSnapshot):
-                raise ValueError("A data-plane rank contributed an invalid reader snapshot.")
-            if snapshot.rank not in self._data_plane.ranks:
-                raise ValueError(f"Rank {snapshot.rank} is outside the configured data plane.")
-            normalized.append(snapshot)
-        contributed_ranks = [snapshot.rank for snapshot in normalized]
-        if len(contributed_ranks) != len(set(contributed_ranks)) or set(contributed_ranks) != set(
-                self._data_plane.ranks
-        ):
-            raise ValueError(
-                f"Data-plane reader snapshots have invalid rank coverage {contributed_ranks}."
-            )
-        return tuple(normalized)
-
-    def _plan_reader_snapshots(
-            self, normalized: tuple[_ReaderSnapshot, ...],
-    ) -> DistributedPackingPlan | None:
+        # Fixed-group gather already supplies one snapshot per rank in rank order.
         reader_snapshots = [
-            snapshot for snapshot in normalized if snapshot.rank in self._dataset_reader_ranks
+            snapshot for snapshot in snapshots if snapshot.rank in self._dataset_reader_ranks
         ]
         if self._batch_sampler_mode:
             selection = self._select_native_batch(reader_snapshots)
@@ -659,31 +613,20 @@ class DistributedDataLoader(Iterator[Any]):
         validate that every local producer emitted the expected number of
         packs; the planner is still free to repack the frozen samples.
         """
-        reader_snapshots = snapshots
-        if not reader_snapshots:
+        if all(snapshot.exhausted for snapshot in snapshots):
             return None
-        if all(snapshot.exhausted for snapshot in reader_snapshots):
-            return None
-        if any(snapshot.exhausted for snapshot in reader_snapshots):
+        if any(snapshot.exhausted for snapshot in snapshots):
             raise ValueError("External-step readers exhausted at different forward/backward steps.")
-        expected_bins = self._planner.distributed_bin_count
         original_metadatas = tuple(
             packing_bin
-            for snapshot in sorted(reader_snapshots, key=lambda item: item.rank)
+            for snapshot in snapshots
             for packing_bin in snapshot.original_metadatas
         )
-        if len(original_metadatas) != expected_bins:
-            raise ValueError(
-                f"External-step producers emitted {len(original_metadatas)} local packs, "
-                f"expected {expected_bins}."
-            )
         samples = tuple(
             item
-            for snapshot in sorted(reader_snapshots, key=lambda item: item.rank)
+            for snapshot in snapshots
             for item in snapshot.metadata
         )
-        if not samples:
-            raise ValueError("External-step producers emitted no samples for an active step.")
         # Reader-local streams have different sample counts, so their source
         # ordinals are not contiguous globally.  Renumber only the frozen
         # selection; SampleKey remains the routing identity.
@@ -720,8 +663,6 @@ class DistributedDataLoader(Iterator[Any]):
     ) -> PreparedPayloadExchange:
         outgoing: dict[int, list[tuple[SampleKey, Any]]] = {}
         if local_selected_keys:
-            if self._dataset_reader is None:
-                raise ValueError("A planned Dataset Reader rank has no Dataset Reader.")
             payloads = self._dataset_reader.selected_payloads(local_selected_keys)
             target_by_key = {
                 key: self._topology.constructor_ranks[data_rank]

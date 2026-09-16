@@ -185,6 +185,22 @@ class TestNativeBatchSampler(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "invalid metadata callback"):
             next(loader)
 
+    def test_callback_errors_propagate_without_wrapping(self) -> None:
+        """Only StopIteration needs translation; normal callback errors retain identity."""
+        failure = ValueError("metadata unavailable")
+        for double_buffer in (False, True):
+            with self.subTest(double_buffer=double_buffer):
+                loader = build_distributed_dataloader(
+                    _TrackedDataset(), _StandaloneMesh(),
+                    DistributedDatasetConfig(seq_len=16, local_batch_size=2, double_buffer=double_buffer),
+                    batch_sampler=_sampler(), metadata_fn=_metadata,
+                )
+                with patch.object(loader._dataset_reader, "_metadata_fn", side_effect=failure):
+                    with self.assertRaises(ValueError) as caught:
+                        next(loader)
+                self.assertIs(caught.exception, failure)
+                self.assertEqual(loader._dataset_reader.state_dict()["sampler"]["consumed_samples"], 0)
+
     def test_invalid_native_sampler_options_fail_at_build(self) -> None:
         """Reject incompatible slicing, shuffle, sizing, and custom packing early."""
         for options in ({"shuffle": True}, {"dataset_already_sharded": True}):

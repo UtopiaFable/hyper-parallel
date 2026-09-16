@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Tests for framed CPU payload serialization and integrity validation."""
+"""Tests for internal payload serialization and sample conservation."""
 
-import hashlib
 import pickle
 import unittest
 from typing import Any
@@ -32,17 +31,13 @@ from hyper_parallel.distributed_data.transport import (
     _encode_model_batch,
     create_data_groups,
     _decode_payload_segment,
+    _decode_received_payloads,
     _encode_payload_segment,
 )
 
 
-def _frame(value: Any) -> bytes:
-    payload = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
-    return b"HPDDP1" + hashlib.sha256(payload).digest() + payload
-
-
 class TestPayloadCodec(unittest.TestCase):
-    """Verify route frames detect corruption and malformed sample identities."""
+    """Verify route round trips and conservation checks at payload merge."""
 
     def test_round_trip_preserves_order_keys_and_payloads(self) -> None:
         """A valid route segment round-trips without changing payload order."""
@@ -57,36 +52,35 @@ class TestPayloadCodec(unittest.TestCase):
         self.assertEqual(_encode_payload_segment(()), b"")
         self.assertEqual(_decode_payload_segment(b""), ())
 
-    def test_encoder_rejects_duplicate_sample_keys(self) -> None:
-        """One reader route cannot claim the same raw sample twice."""
-        duplicate = SampleKey(0, 1)
+    def test_wire_format_is_plain_pickle(self) -> None:
+        """All routes use the same codec without a second framing/checksum pass."""
+        items = ((SampleKey(0, 1), {"value": 3}),)
 
-        with self.assertRaisesRegex(ValueError, "unique SampleKey"):
-            _encode_payload_segment(((duplicate, "first"), (duplicate, "second")))
+        self.assertEqual(_encode_payload_segment(items), pickle.dumps(items, protocol=pickle.HIGHEST_PROTOCOL))
 
-    def test_decoder_rejects_header_and_checksum_corruption(self) -> None:
-        """Frame magic and SHA-256 digest are both validated before unpickling."""
-        encoded = _encode_payload_segment(((SampleKey(0, 1), {"value": 3}),))
-        bad_header = b"BROKEN" + encoded[6:]
-        bad_payload = encoded[:-1] + bytes((encoded[-1] ^ 0x01,))
+    def test_decoder_propagates_pickle_errors(self) -> None:
+        """Deserialization retains the original exception instead of wrapping it."""
+        with self.assertRaises(pickle.UnpicklingError):
+            _decode_payload_segment(b"invalid pickle")
 
-        with self.assertRaisesRegex(ValueError, "invalid frame header"):
-            _decode_payload_segment(bad_header)
-        with self.assertRaisesRegex(ValueError, "checksum mismatch"):
-            _decode_payload_segment(bad_payload)
+    def test_receive_rejects_duplicates_within_and_across_routes(self) -> None:
+        """Merging into a dictionary must not silently overwrite an occurrence."""
+        key = SampleKey(1, 5)
+        for segments in (
+                (_encode_payload_segment(((key, "first"), (key, "second"))),),
+                (_encode_payload_segment(((key, "first"),)), _encode_payload_segment(((key, "second"),))),
+        ):
+            with self.subTest(segment_count=len(segments)), self.assertRaisesRegex(ValueError, "duplicate payload"):
+                _decode_received_payloads(b"".join(segments), tuple(map(len, segments)))
 
-    def test_decoder_rejects_validly_framed_non_route_payload(self) -> None:
-        """A matching digest does not bypass the route schema validation."""
-        with self.assertRaisesRegex(ValueError, "invalid route segment"):
-            _decode_payload_segment(_frame([(SampleKey(0, 0), "payload")]))
+    def test_receive_preserves_empty_routes_and_repeated_dataset_indices(self) -> None:
+        """Distinct sampling occurrences may legitimately refer to the same index."""
+        items = ((SampleKey(0, 3, 0), "first"), (SampleKey(0, 3, 1), "second"))
+        segments = (b"", _encode_payload_segment(items[:1]), b"", _encode_payload_segment(items[1:]))
 
-    def test_decoder_rejects_duplicate_keys_from_a_valid_pickle(self) -> None:
-        """The receiver independently checks uniqueness instead of trusting the sender."""
-        duplicate = SampleKey(1, 5)
-        frame = _frame(((duplicate, "first"), (duplicate, "second")))
+        result = _decode_received_payloads(b"".join(segments), tuple(map(len, segments)))
 
-        with self.assertRaisesRegex(ValueError, "duplicate SampleKey"):
-            _decode_payload_segment(frame)
+        self.assertEqual(result, dict(items))
 
 
 class TestDataPlaneTransport(unittest.TestCase):
@@ -150,7 +144,7 @@ class TestDataPlaneTransport(unittest.TestCase):
         new_group.assert_not_called()
 
     def test_payload_a2a_uses_payload_group_after_cpu_size_exchange(self) -> None:
-        """Variable split sizes stay on control while framed bytes use the payload group."""
+        """Variable split sizes stay on control while payload bytes use the payload group."""
         groups = DataGroups(
             data_plane_ranks=(0, 1),
             control_group="control",
@@ -183,6 +177,30 @@ class TestDataPlaneTransport(unittest.TestCase):
 
         self.assertEqual(received, expected)
         self.assertEqual(collective_groups, ["control", "payload"])
+
+    def test_singleton_exchange_still_rejects_duplicate_occurrences(self) -> None:
+        """Local bypass and multi-rank A2A share the same payload merge contract."""
+        transport = DataPlaneTransport(DataGroups((0,), None, None, None, 0, False), global_rank=0)
+        key = SampleKey(0, 1)
+        prepared = transport.prepare_exchange({0: ((key, "first"), (key, "second"))})
+
+        with self.assertRaisesRegex(ValueError, "duplicate payload"):
+            transport.exchange_prepared(prepared)
+
+    def test_unknown_target_is_not_silently_dropped(self) -> None:
+        """Payload routes outside the fixed data plane still fail before A2A."""
+        transport = DataPlaneTransport(DataGroups((0,), None, None, None, 0, False), global_rank=0)
+
+        with self.assertRaisesRegex(ValueError, "outside the data plane"):
+            transport.prepare_exchange({1: ((SampleKey(0, 1), "sample"),)})
+
+    def test_missing_control_group_fails_at_construction(self) -> None:
+        """Check immutable group configuration once rather than on every collective."""
+        groups = DataGroups((0, 1), None, None, None, 0, False)
+
+        with self.assertRaisesRegex(ValueError, "initialized process group"):
+            DataPlaneTransport(groups, global_rank=0)
+        self.assertFalse(DataPlaneTransport(groups, global_rank=2).is_member)
 
 
 class TestModelParallelTransport(unittest.TestCase):
@@ -221,6 +239,57 @@ class TestModelParallelTransport(unittest.TestCase):
         tensor_broadcast.assert_called_once()
         self.assertEqual(object_broadcast.call_args.kwargs["group"], "model")
         self.assertEqual(tensor_broadcast.call_args.kwargs["group"], "model")
+
+    def test_receiver_rebuilds_nested_batch_and_eof(self) -> None:
+        """Directly broadcast tensors populate the receiver's local structure."""
+        topology = DataTopology.from_layout(
+            mesh_shape=(1, 2), mesh_dim_names=("dp", "mp"), rank_list=(0, 1),
+            global_rank=1, dp_dim_names=("dp",),
+        )
+        groups = DataGroups((0,), None, None, "model", 0, True)
+        transport = ModelParallelTransport(topology, groups)
+        batch = {"inputs": (torch.tensor([1, 2]), [torch.tensor([[3.0]]), "text"])}
+        schema, tensors = _encode_model_batch(batch)
+        pending = iter(tensors)
+
+        def broadcast_schema(payload: list, **_kwargs: Any) -> None:
+            """Supply the constructor's schema to this receiver."""
+            payload[0] = schema
+
+        def broadcast_tensor(tensor: torch.Tensor, **_kwargs: Any) -> None:
+            """Populate tensor leaves in encoder order."""
+            tensor.copy_(next(pending))
+
+        with (
+                patch("hyper_parallel.distributed_data.transport.dist.broadcast_object_list",
+                      side_effect=broadcast_schema),
+                patch("hyper_parallel.distributed_data.transport.dist.broadcast",
+                      side_effect=broadcast_tensor) as broadcast,
+                patch("hyper_parallel.distributed_data.transport.dist.get_backend", return_value="gloo"),
+        ):
+            received = transport.broadcast(None)
+            self.assertEqual(broadcast.call_count, 2)
+            schema, _ = _encode_model_batch(None)
+            self.assertIsNone(transport.broadcast(None))
+            self.assertEqual(broadcast.call_count, 2)
+
+        self.assertTrue(torch.equal(received["inputs"][0], batch["inputs"][0]))
+        self.assertTrue(torch.equal(received["inputs"][1][0], batch["inputs"][1][0]))
+        self.assertEqual(received["inputs"][1][1], "text")
+
+    def test_device_backend_mismatch_still_fails_before_tensor_broadcast(self) -> None:
+        """User tensors must remain compatible with their collective backend."""
+        groups = DataGroups((0,), None, None, "model", 0, True)
+        transport = ModelParallelTransport(self._topology(), groups)
+        with (
+                patch("hyper_parallel.distributed_data.transport.dist.broadcast_object_list"),
+                patch("hyper_parallel.distributed_data.transport.dist.broadcast") as broadcast,
+                patch("hyper_parallel.distributed_data.transport.dist.get_backend", return_value="hccl"),
+                self.assertRaisesRegex(ValueError, "incompatible"),
+        ):
+            transport.broadcast({"input_ids": torch.tensor([1, 2])})
+
+        broadcast.assert_not_called()
 
 
 if __name__ == "__main__":

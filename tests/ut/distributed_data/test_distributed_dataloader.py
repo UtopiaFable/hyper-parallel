@@ -21,6 +21,8 @@ from unittest.mock import patch
 
 from hyper_parallel.auto_models.components.datasets.parallel import build_dataset_batch_sampler
 from hyper_parallel.distributed_data import DistributedDatasetConfig, SampleMetadata, build_distributed_dataloader
+from hyper_parallel.distributed_data.distributed_dataloader import _ReaderSnapshot
+from hyper_parallel.distributed_data.planner import DynamicPackingPlanner
 from hyper_parallel.distributed_data.schema import BufferedSampleMetadata, DistributedPackingPlan, SampleKey
 from tests.common.mark_utils import arg_mark
 
@@ -128,6 +130,76 @@ def _sampler(size=6, local_batch_size=2):
 
 class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
     """Verify that each plan consumes one externally determined step."""
+
+    def test_plan_uses_reader_snapshots_in_collective_order(self) -> None:
+        """Non-readers are filtered without changing source-selected membership."""
+        loader = _external_loader()
+        first = BufferedSampleMetadata(SampleKey(0, 8), SampleMetadata(4), 7)
+        second = BufferedSampleMetadata(SampleKey(2, 3), SampleMetadata(6), 42)
+        snapshots = (
+            _ReaderSnapshot(0, False, (first,), ((first,),)),
+            _ReaderSnapshot(1, True, ()),
+            _ReaderSnapshot(2, False, (second,), ((second,),)),
+        )
+        planner = DynamicPackingPlanner(data_parallel_size=2, seq_len=10, local_batch_size=1)
+        with (
+                patch.object(loader, "_dataset_reader_ranks", frozenset((0, 2))),
+                patch.object(loader, "_planner", planner),
+                patch.object(planner, "plan", wraps=planner.plan) as plan_step,
+        ):
+            plan = loader._build_plan_control(snapshots)
+
+        selection = plan_step.call_args.args[0]
+        self.assertEqual(tuple(item.key for item in selection.samples), (first.key, second.key))
+        self.assertEqual(tuple(item.global_sample_position for item in selection.samples), (0, 1))
+        self.assertEqual(selection.reference_bins, ((first.key,), (second.key,)))
+        self.assertEqual(set(plan.selected_keys), {first.key, second.key})
+
+    def test_readers_must_exhaust_at_the_same_step(self) -> None:
+        """Partial EOF remains an error in both native and external step modes."""
+        loader = _external_loader()
+        sample = BufferedSampleMetadata(SampleKey(0, 0), SampleMetadata(1), 0)
+        partial = (_ReaderSnapshot(0, False, (sample,), ((sample,),)), _ReaderSnapshot(1, True, ()))
+        exhausted = (_ReaderSnapshot(0, True, ()), _ReaderSnapshot(1, True, ()))
+        for native in (False, True):
+            with (
+                    self.subTest(native=native),
+                    patch.object(loader, "_dataset_reader_ranks", frozenset((0, 1))),
+                    patch.object(loader, "_batch_sampler_mode", native),
+            ):
+                with self.assertRaisesRegex(ValueError, "exhausted at different"):
+                    loader._build_plan_control(partial)
+                self.assertIsNone(loader._build_plan_control(exhausted))
+
+    def test_external_pack_count_is_checked_by_planner(self) -> None:
+        """Removing duplicate loader checks must not accept a wrong step size."""
+        reader = _StepReader([[[{"id": 0, "tokens": 1}], [{"id": 1, "tokens": 1}]]])
+        loader = _external_loader(reader)
+
+        with self.assertRaisesRegex(ValueError, "expected 1 reference bins"):
+            next(loader)
+        self.assertEqual(reader.position, 0)
+
+    def test_missing_payload_fails_before_committing_reader(self) -> None:
+        """Exact Constructor membership checks prevent silently dropped samples."""
+        reader = _StepReader(_steps())
+        loader = _external_loader(reader)
+
+        with patch.object(reader, "selected_payloads", return_value=()):
+            with self.assertRaisesRegex(ValueError, "payload keys do not match"):
+                next(loader)
+
+        self.assertEqual(reader.position, 0)
+
+    def test_active_step_requires_samples_and_non_none_batch(self) -> None:
+        """Empty metadata and a collator returning the EOF sentinel remain invalid."""
+        loader = _external_loader()
+        with self.assertRaisesRegex(ValueError, "samples must not be empty"):
+            loader._build_plan_control((_ReaderSnapshot(0, False, ()),))
+        with patch.object(loader._data_constructor, "construct", return_value=None):
+            with self.assertRaisesRegex(ValueError, "non-None batch"):
+                next(loader)
+        self.assertEqual(loader._dataset_reader.position, 0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_explicit_and_inferred_metadata_require_batch_sampler(self) -> None:
@@ -244,7 +316,7 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
         """
         reader = _StepReader([[]])
         loader = _external_loader(reader)
-        with self.assertRaisesRegex(ValueError, "emitted 0 local packs"):
+        with self.assertRaisesRegex(ValueError, "samples must not be empty"):
             next(loader)
         self.assertEqual(reader.prepare_calls, 1)
 

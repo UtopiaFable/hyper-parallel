@@ -94,6 +94,8 @@ class BatchSamplerReader:
             sample_loader: PlannedSampleLoader | None,
     ) -> None:
         """Store the validated native sampler and metadata/payload sources."""
+        if metadata is None and (sample_loader is None or not callable(metadata_fn)):
+            raise ValueError("Online BatchSampler Reader requires payload loading and metadata_fn.")
         self._sampler = sampler
         self._reader_rank = reader_rank
         self._policy_fingerprint = policy_fingerprint
@@ -141,8 +143,6 @@ class BatchSamplerReader:
             if self._pending_state["consumed_samples"] != expected_position:
                 raise ValueError("Native BatchSampler must advance exactly one global local-batch round per yield.")
             if self._metadata is None:
-                if self._sample_loader is None or self._metadata_fn is None:
-                    raise ValueError("Online BatchSampler Reader requires payload loading and metadata_fn.")
                 self._payloads = self._sample_loader.fetch_keys(keys)
                 metadata = [self._metadata_fn(self._payloads[key]) for key in keys]
             else:
@@ -153,10 +153,9 @@ class BatchSamplerReader:
                 BufferedSampleMetadata(key, item, key.global_sample_position)
                 for key, item in zip(keys, metadata)
             )
-        except Exception as exc:
-            raise RuntimeError(
-                f"Native BatchSampler Reader failed: {type(exc).__name__}: {exc}"
-            ) from exc
+        except StopIteration as exc:
+            # A user callback's StopIteration must not masquerade as dataset EOF.
+            raise RuntimeError(f"Native BatchSampler callback raised StopIteration: {exc}") from exc
         return None
 
     def _sample_keys(self, indices: Sequence[int]) -> tuple[SampleKey, ...]:

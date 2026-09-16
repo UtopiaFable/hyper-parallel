@@ -26,7 +26,6 @@ from torch.utils.data import DataLoader, Dataset, Sampler  # pylint: disable=for
 from hyper_parallel.distributed_data.schema import SampleKey
 from hyper_parallel.distributed_data.dataset_reader import (
     _IndexedDataset,
-    _IndexedPayload,
     _build_worker_options,
     _identity,
 )
@@ -146,8 +145,6 @@ class PlannedSampleLoader:
                 indexed_payload = next(iterator)
             except StopIteration as exc:
                 raise ValueError("Plan-aware DataLoader exhausted before all requested samples were read.") from exc
-            if not isinstance(indexed_payload, _IndexedPayload):
-                raise ValueError(f"Plan-aware DataLoader returned invalid payload type {type(indexed_payload)}.")
             if indexed_payload.dataset_index != expected_key.dataset_index:
                 raise ValueError(
                     f"Plan-aware DataLoader expected index {expected_key.dataset_index}, "
