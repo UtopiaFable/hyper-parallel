@@ -65,14 +65,20 @@ def _sampler(**overrides: object) -> object:
     return build_dataset_batch_sampler(**options)
 
 
-def _loader(dataset: object, *, sampler: object = None, metadata_mode: bool = False, **options: object) -> object:
+def _loader(
+        dataset: object, *, sampler: object = None, metadata_mode: bool = False,
+        double_buffer: bool = False, **options: object,
+) -> object:
     kwargs = {"metadata": [SampleMetadata(pack_tokens=1, sample_id=index) for index in range(len(dataset))]}
     if not metadata_mode:
         kwargs = {"metadata_fn": _metadata}
-    return build_distributed_dataloader(
+    loader = build_distributed_dataloader(
         dataset, _StandaloneMesh(), DistributedDatasetConfig(seq_len=16, local_batch_size=2, **options),
         batch_sampler=sampler if sampler is not None else _sampler(), **kwargs,
     )
+    # Public native loading is synchronous; this switch exercises the retained runtime.
+    loader._double_buffer = double_buffer
+    return loader
 
 
 def _batch_ids(batch: tuple) -> list[int]:
@@ -192,9 +198,10 @@ class TestNativeBatchSampler(unittest.TestCase):
             with self.subTest(double_buffer=double_buffer):
                 loader = build_distributed_dataloader(
                     _TrackedDataset(), _StandaloneMesh(),
-                    DistributedDatasetConfig(seq_len=16, local_batch_size=2, double_buffer=double_buffer),
+                    DistributedDatasetConfig(seq_len=16, local_batch_size=2),
                     batch_sampler=_sampler(), metadata_fn=_metadata,
                 )
+                loader._double_buffer = double_buffer
                 with patch.object(loader._dataset_reader, "_metadata_fn", side_effect=failure):
                     with self.assertRaises(ValueError) as caught:
                         next(loader)
@@ -287,4 +294,4 @@ class TestNativeBatchSampler(unittest.TestCase):
                 training_config=SimpleNamespace(micro_batch_size=2, global_batch_size=4, seed=7),
                 data_config={"seq_length": 16, "load_balance": "native_batch_sampler"},
             )
-        self.assertEqual(str(build.call_args.kwargs["communication_device"]), "cuda:3")
+        self.assertEqual(str(build.call_args.kwargs["device"]), "cuda:3")

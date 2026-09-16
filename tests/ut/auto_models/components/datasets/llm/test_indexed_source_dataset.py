@@ -394,12 +394,12 @@ class TestIndexedSourceDataset(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_trainer_resumes_and_continues_across_dynamic_epochs(self) -> None:
         """Feature: Dynamic source epoch and Trainer resume.
-        Description: Resume a double-buffer loader and continue across source epoch boundaries.
+        Description: Resume a native sampler loader and continue across source epoch boundaries.
         Expectation: The restored next batch is preserved and training reaches the requested optimizer step.
         """
         with TemporaryDirectory() as directory:
             prefix = _write_indexed_source(directory, "corpus", [[1, 2, 9], [3, 4, 9], [5, 6, 9]])
-            config = _provider_config(seq_length=2, distributed_dataloader={"double_buffer": True})
+            config = _provider_config(seq_length=2)
             datasets = build_indexed_text_dataset(
                 data_path=prefix, data_config=config, tokenizer=_Tokenizer(),
                 train_valid_test_num_samples=(1, 0, 0),

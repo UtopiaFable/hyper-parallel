@@ -32,15 +32,14 @@ from hyper_parallel.auto_models.components.loss.loss_utils import count_loss_tok
 from tests.common.vlm_fixtures import build_image_corpus, vlm_loader_target
 
 
-def _build_loader(dataset: object, mesh: object, double_buffer: bool, workers: int) -> object:
+def _build_loader(dataset: object, mesh: object, workers: int) -> object:
     loaders, _ = build_dataloader(
         vlm_loader_target(num_workers=workers, prefetch_factor=2 if workers else None,
                           persistent_workers=bool(workers)),
         datasets=(dataset, None, None), collate_fn=VLMCollator(),
         mesh_context=SimpleNamespace(dp_rank=dist.get_rank(), dp_size=2, device_mesh=mesh),
         training_config=SimpleNamespace(micro_batch_size=2, global_batch_size=8, seed=17),
-        data_config={"source_type": "online", "load_balance": "native_batch_sampler",
-                     "distributed_dataloader": {"double_buffer": double_buffer}},
+        data_config={"source_type": "online", "load_balance": "native_batch_sampler"},
         max_seq_len=64, metadata_fn=vlm_sample_metadata,
     )
     return loaders[0]
@@ -78,12 +77,12 @@ def _gradient(batch: dict, mesh: object) -> tuple[torch.Tensor, torch.Tensor]:
     return weighted.detach(), gradient / 2
 
 
-def _run_case(dataset: object, mesh: object, *, double_buffer: bool, workers: int) -> None:
+def _run_case(dataset: object, mesh: object, *, workers: int) -> None:
     sampler = build_dataset_batch_sampler(
         total_samples=len(dataset), micro_batch_size=2, global_batch_size=8, dp_rank=dist.get_rank(), dp_world_size=2,
     )
     reference = list(sampler)
-    loader = _build_loader(dataset, mesh, double_buffer, workers)
+    loader = _build_loader(dataset, mesh, workers)
     delivered, checkpoint = [], None
     actual_step_gradient = expected_step_gradient = torch.tensor(0.0, dtype=torch.float64)
     for round_idx, indices in enumerate(reference):
@@ -113,7 +112,7 @@ def _run_case(dataset: object, mesh: object, *, double_buffer: bool, workers: in
             cursor = checkpoint["dataset_reader"]["sampler"]["consumed_samples"]
             assert cursor == 4, f"Prefetch leaked into checkpoint: cursor={cursor}, expected=4"
     assert not list(loader), f"Expected exhaustion after {len(reference)} native rounds"
-    resumed = _build_loader(dataset, mesh, double_buffer, workers)
+    resumed = _build_loader(dataset, mesh, workers)
     resumed.load_state_dict(checkpoint)
     remaining = list(resumed)
     assert len(remaining) == len(delivered) - 1, f"Replay count mismatch: got={len(remaining)}, expected=3"
@@ -128,8 +127,8 @@ def test_native_vlm_dp2_gloo() -> None:
         mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("dp",))
         with TemporaryDirectory() as directory:
             dataset = build_image_corpus(directory)
-            for double_buffer, workers in ((False, 0), (True, 0), (True, 2)):
-                _run_case(dataset, mesh, double_buffer=double_buffer, workers=workers)
+            for workers in (0, 2):
+                _run_case(dataset, mesh, workers=workers)
         dist.barrier()
     finally:
         dist.destroy_process_group()

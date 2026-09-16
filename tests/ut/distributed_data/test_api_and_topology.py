@@ -41,13 +41,14 @@ class TestDistributedDataPublicApi(unittest.TestCase):
 
         self.assertIn("seq_len", field_names)
         self.assertIn("local_batch_size", field_names)
-        self.assertIn("double_buffer", field_names)
+        self.assertIn("enable_dp_balance", field_names)
+        self.assertNotIn("double_buffer", field_names)
         self.assertIn("dataset_already_sharded", field_names)
         self.assertNotIn("raw_sample_size", field_names)
         self.assertNotIn("micro_batch_num", field_names)
 
         config = DistributedDatasetConfig(seq_len=32_768, local_batch_size=4)
-        self.assertFalse(config.double_buffer)
+        self.assertFalse(config.enable_dp_balance)
         self.assertFalse(config.dataset_already_sharded)
         self.assertFalse(hasattr(config, "raw_sample_size"))
         self.assertFalse(hasattr(config, "micro_batch_num"))
@@ -66,7 +67,8 @@ class TestDistributedDataPublicApi(unittest.TestCase):
         self.assertEqual(parameters["metadata"].kind, inspect.Parameter.KEYWORD_ONLY)
         self.assertEqual(parameters["pack_fn"].kind, inspect.Parameter.KEYWORD_ONLY)
         self.assertEqual(parameters["collate_fn"].kind, inspect.Parameter.KEYWORD_ONLY)
-        self.assertEqual(parameters["communication_device"].kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertEqual(parameters["device"].kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertNotIn("communication_device", parameters)
         self.assertIsNone(parameters["metadata_fn"].default)
         self.assertIsNone(parameters["metadata"].default)
         self.assertIsNone(parameters["pack_fn"].default)
@@ -121,22 +123,23 @@ class TestDistributedDataPublicApi(unittest.TestCase):
         self.assertEqual(config.buffer_size_multiplier, huge_multiplier)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_control_backend_must_support_cpu_object_collectives(self) -> None:
-        """Feature: Control-plane backend validation.
-        Description: Configure an accelerator-only backend for object collectives.
-        Expectation: The invalid control backend is rejected.
+    def test_backend_selection_is_internal(self) -> None:
+        """Feature: Fixed control-plane backend.
+        Description: Inspect the public configuration fields.
+        Expectation: Backend selection is no longer a caller-facing option.
         """
-        with self.assertRaisesRegex(ValueError, "cpu_backend must support CPU tensors"):
-            DistributedDatasetConfig(seq_len=32, local_batch_size=1, cpu_backend="hccl")
+        field_names = {field.name for field in fields(DistributedDatasetConfig)}
+        self.assertNotIn("cpu_backend", field_names)
+        self.assertNotIn("payload_backend", field_names)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_double_buffer_must_be_boolean(self) -> None:
-        """Feature: Host double buffering.
+    def test_enable_dp_balance_must_be_boolean(self) -> None:
+        """Feature: Node-local balancing.
         Description: Configure the overlap switch with a truthy non-boolean value.
         Expectation: Configuration validation rejects the invalid value.
         """
-        with self.assertRaisesRegex(ValueError, "double_buffer must be boolean"):
-            DistributedDatasetConfig(seq_len=32, local_batch_size=1, double_buffer=1)
+        with self.assertRaisesRegex(ValueError, "enable_dp_balance must be boolean"):
+            DistributedDatasetConfig(seq_len=32, local_batch_size=1, enable_dp_balance=1)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_dataset_already_sharded_must_be_boolean(self) -> None:
@@ -200,7 +203,7 @@ class TestDistributedDataBuildState(unittest.TestCase):
         """Option errors and metadata size mismatches must retain synchronized failure."""
         cases = (
             ({"dataloader_kwargs": {"num_workers": -1}}, "num_workers"),
-            ({"communication_device": "invalid-device"}, "communication_device"),
+            ({"device": "invalid-device"}, "communication_device"),
             ({"metadata": [SampleMetadata(pack_tokens=1)]}, "Metadata mode requires batch_sampler"),
         )
         for sharded in (False, True):

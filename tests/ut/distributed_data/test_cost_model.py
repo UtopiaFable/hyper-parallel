@@ -18,6 +18,8 @@ import unittest
 from dataclasses import replace
 
 from hyper_parallel.distributed_data import BackboneFlopsConfig, DefaultCostModel, SampleMetadata, WorkloadCost
+from hyper_parallel.distributed_data.cost_model import resolve_cost_model
+from tests.common.mark_utils import arg_mark
 
 
 def _backbone_config() -> BackboneFlopsConfig:
@@ -30,14 +32,28 @@ def _backbone_config() -> BackboneFlopsConfig:
 
 
 class TestCostModel(unittest.TestCase):
-    """Verify metadata passthrough, backbone estimates, and dimension validation."""
+    """Verify explicit model configuration, overrides, and backbone estimates."""
 
-    def test_default_preserves_explicit_metadata_cost(self) -> None:
-        """Without a model configuration, the caller's cost components remain intact."""
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_default_requires_model_configuration(self) -> None:
+        """Feature: Explicit default cost configuration.
+        Description: Construct the FLOPs model without model dimensions.
+        Expectation: Missing dimensions are rejected rather than using arbitrary costs.
+        """
+        with self.assertRaisesRegex(ValueError, "model_config"):
+            DefaultCostModel(None)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_custom_cost_model_does_not_require_model_configuration(self) -> None:
+        """Feature: Custom workload model.
+        Description: Resolve a metadata-based callback without backbone dimensions.
+        Expectation: The callback retains the explicitly provided stage costs.
+        """
         cost = WorkloadCost(io=1, encoder=2, llm=3)
         metadata = SampleMetadata(pack_tokens=4, cost=cost)
 
-        self.assertEqual(DefaultCostModel()(metadata), cost)
+        model = resolve_cost_model(lambda sample: sample.cost, None)
+        self.assertEqual(model(metadata), cost)
 
     def test_backbone_estimate_preserves_token_footprint(self) -> None:
         """Forward projections, MLP and attention costs use independent sample dimensions."""

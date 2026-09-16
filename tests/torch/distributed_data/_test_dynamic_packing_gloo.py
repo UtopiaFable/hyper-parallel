@@ -22,7 +22,7 @@ from torch.distributed.device_mesh import init_device_mesh
 
 from hyper_parallel.distributed_data import (
     DistributedDatasetConfig, SampleMetadata, WorkloadCost, build_distributed_dataloader,
-    build_local_balancing_dataloader,
+    build_distributed_dataset, build_local_balancing_dataloader,
 )
 from hyper_parallel.distributed_data.schema import BufferedSampleMetadata, SampleKey
 
@@ -117,13 +117,16 @@ def _gather(value):
 def _loader(mesh, reader_ranks, double_buffer):
     rank = dist.get_rank()
     reader = _StepReader(rank, reader_ranks.index(rank)) if rank in reader_ranks else None
-    return build_distributed_dataloader(
+    loader = build_distributed_dataloader(
         None, mesh,
         DistributedDatasetConfig(
-            seq_len=10, local_batch_size=1, dataset_reader_ranks=reader_ranks, double_buffer=double_buffer,
+            seq_len=10, local_batch_size=1, dataset_reader_ranks=reader_ranks,
         ),
         external_step_reader=reader,
     )
+    # Keep low-level runtime coverage after removal of the public prefetch switch.
+    loader._double_buffer = double_buffer
+    return loader
 
 
 def _run_steps(mesh, reader_ranks, double_buffer):
@@ -158,7 +161,7 @@ def _run_steps(mesh, reader_ranks, double_buffer):
     resumed.wait_for_prefetch()
 
 
-def _run_local_steps(double_buffer: bool) -> None:
+def _run_local_steps(dataset_api: bool) -> None:
     """Exercise the shared codec through locality-scoped moved and retained steps."""
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -168,18 +171,25 @@ def _run_local_steps(double_buffer: bool) -> None:
            "cost": 9 if step == 0 and rank == 0 else 1} for ordinal in range(2)]]
         for step in range(2)
     ]
-    loader = build_local_balancing_dataloader(
-        steps, mesh,
-        DistributedDatasetConfig(seq_len=10, local_batch_size=1, double_buffer=double_buffer),
-        metadata_fn=lambda sample: SampleMetadata(5, cost=WorkloadCost(llm=sample["cost"])),
-        pack_fn=lambda samples, _seq_len: tuple(samples),
-        collate_fn=tuple,
-        node_id="test-node",
-        enable_balancing=True,
-        communication_device="cpu",
-        max_steps=2,
-        balance_stats_callback=None,
-    )
+    config = DistributedDatasetConfig(seq_len=10, local_batch_size=1, enable_dp_balance=True)
+
+    def metadata_fn(sample: dict) -> SampleMetadata:
+        """Return a fixed footprint with deliberately skewed per-sample costs.
+
+        Args:
+            sample: Raw sample carrying its synthetic cost.
+        """
+        return SampleMetadata(5, cost=WorkloadCost(llm=sample["cost"]))
+
+    options = {"cost_model": lambda metadata: metadata.cost, "device": "cpu", "max_steps": 2}
+    if dataset_api:
+        dataset = build_distributed_dataset(steps, metadata=metadata_fn, collate_fn=tuple)
+        loader = build_distributed_dataloader(dataset, mesh, config, **options)
+    else:
+        loader = build_local_balancing_dataloader(
+            steps, mesh, config, metadata_fn=metadata_fn,
+            pack_fn=lambda samples, _seq_len: tuple(samples), collate_fn=tuple, **options,
+        )
     try:
         for step in range(2):
             batch = next(loader)
@@ -212,7 +222,7 @@ def test_dynamic_packing_dp2_mp2_gloo() -> None:
         for reader_ranks in ((0, 2), (1, 3)):
             for double_buffer in (False, True):
                 _run_steps(mesh, reader_ranks, double_buffer)
-        for double_buffer in (False, True):
-            _run_local_steps(double_buffer)
+        for dataset_api in (False, True):
+            _run_local_steps(dataset_api)
     finally:
         dist.destroy_process_group()

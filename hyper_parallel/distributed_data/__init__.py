@@ -18,6 +18,8 @@ from hyper_parallel.distributed_data.api import DistributedDatasetConfig, build_
 from hyper_parallel.distributed_data.balance_logging import format_balance_stats, log_balance_stats
 from hyper_parallel.distributed_data.cost_model import BackboneFlopsConfig, CostModel, DefaultCostModel
 from hyper_parallel.distributed_data.data_constructor import default_collate_fn, default_pack_fn
+from hyper_parallel.distributed_data.dataset import DistributedDataset, build_distributed_dataset
+from hyper_parallel.distributed_data.dataset_dataloader import DatasetDataLoader
 from hyper_parallel.distributed_data.device_prefetch import DeviceBatchPrefetcher
 from hyper_parallel.distributed_data.distributed_dataloader import DistributedDataLoader
 from hyper_parallel.distributed_data.external_step import ExternalStepAdapter, ExternalStepSource
@@ -38,8 +40,10 @@ __all__ = [
     "BufferedSampleMetadata",
     "CostModel",
     "DefaultCostModel",
+    "DatasetDataLoader",
     "DeviceBatchPrefetcher",
     "DistributedDataLoader",
+    "DistributedDataset",
     "DistributedDatasetConfig",
     "DistributedPackingPlan",
     "ExternalStepAdapter",
@@ -51,6 +55,7 @@ __all__ = [
     "SampleMetadata",
     "WorkloadCost",
     "build_distributed_dataloader",
+    "build_distributed_dataset",
     "build_local_balancing_dataloader",
     "collate_indexed_text_sequences",
     "default_collate_fn",

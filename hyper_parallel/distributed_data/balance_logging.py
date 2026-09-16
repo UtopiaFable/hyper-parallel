@@ -29,17 +29,22 @@ def _layout_lines(label: str, ranks: Sequence[int], layout: Sequence[Any]) -> li
         microbatches = []
         for index, stats in enumerate(bins):
             fields = []
+            displayed = {"seq_len", "samples", "cost"}
             if all(name in stats for name in ("vae_gen", "vae_cond", "vit")):
                 fields.append(
                     f"images(vae_gen={stats['vae_gen']}, vae_cond={stats['vae_cond']}, vit={stats['vit']})"
                 )
+                displayed.update(("vae_gen", "vae_cond", "vit"))
             sequence = f"seq_len={stats['seq_len']}"
             if "P" in stats and "D" in stats:
                 sequence += f" (P={stats['P']}, D={stats['D']})"
+                displayed.update(("P", "D"))
             fields.extend((sequence, f"samples={stats['samples']}"))
             if "pixel_numel" in stats:
                 fields.append(f"pixel_numel={stats['pixel_numel']}")
+                displayed.add("pixel_numel")
             fields.append(f"cost={stats['cost']:.12g}")
+            fields.extend(f"{name}={value}" for name, value in stats.items() if name not in displayed)
             microbatches.append(f"mb{index}: " + ", ".join(fields))
         lines.append(f"  dp{rank}: " + " | ".join(microbatches))
     return lines
@@ -71,7 +76,13 @@ def format_balance_stats(stats: dict[str, Any], step: int, max_steps: int | None
 
 
 def log_balance_stats(stats: dict[str, Any], step: int, max_steps: int | None = None) -> None:
-    """Default log callback; the loader invokes it only on global rank zero."""
+    """Default log callback; the loader invokes it only on global rank zero.
+
+    Args:
+        stats: Before/after costs, bin counters and transfer counts.
+        step: One-based delivered step number.
+        max_steps: Optional training step limit.
+    """
     logger.info("%s", format_balance_stats(stats, step, max_steps))
 
 

@@ -106,7 +106,7 @@ def _collate_sources(samples):
     return collate_indexed_text_sequences([pack_indexed_text_samples([sample], 8) for sample in samples])
 
 
-def _run_epoch(prefix: str, mesh_context: object, double_buffer: bool) -> None:
+def _run_epoch(prefix: str, mesh_context: object) -> None:
     """Check metadata-only Readers, direct Constructor reads, and TP batch broadcast."""
     rank = dist.get_rank()
     config = {
@@ -115,7 +115,6 @@ def _run_epoch(prefix: str, mesh_context: object, double_buffer: bool) -> None:
         "data_lazy_load": True, "distributed_walk": False,
         "reset_position_ids": True,
         "packing_stage": "distributed_dataloader",
-        "distributed_dataloader": {"double_buffer": double_buffer},
     }
     payload_reads = []
     allow_payload_reads = False
@@ -146,7 +145,7 @@ def _run_epoch(prefix: str, mesh_context: object, double_buffer: bool) -> None:
         )
         loader = build_distributed_dataloader(
             datasets[0], mesh_context.device_mesh,
-            DistributedDatasetConfig(seq_len=8, local_batch_size=4, double_buffer=double_buffer),
+            DistributedDatasetConfig(seq_len=8, local_batch_size=4),
             batch_sampler=sampler, collate_fn=_collate_sources,
         )
         runtime = ParallelBatch(
@@ -193,7 +192,6 @@ def _run_native_sampler(prefix: str, mesh_context: object) -> None:
         "packing_stage": "dataset", "load_balance": "native_batch_sampler",
         "create_ltor_fields_in_dataloader": True,
         "reset_position_ids": True, "reset_attention_mask": True, "eod_mask_loss": True,
-        "distributed_dataloader": {"double_buffer": True},
     }
     datasets = build_indexed_text_dataset(
         data_path=prefix, data_config=config, tokenizer=_Tokenizer(),
@@ -249,8 +247,7 @@ def test_indexed_text_dp2_tp2_gloo() -> None:
                 builder.finalize(prefix + ".idx")
                 prefixes[0] = prefix
             dist.broadcast_object_list(prefixes, src=0)
-            for double_buffer in (False, True):
-                _run_epoch(prefixes[0], mesh_context, double_buffer)
+            _run_epoch(prefixes[0], mesh_context)
             _run_native_sampler(prefixes[0], mesh_context)
             dist.barrier()
     finally:

@@ -113,12 +113,15 @@ def _steps():
     ]
 
 
-def _external_loader(reader=None, **options):
+def _external_loader(reader=None, *, double_buffer=False, **options):
     reader = _StepReader(_steps()) if reader is None else reader
-    return build_distributed_dataloader(
+    loader = build_distributed_dataloader(
         None, _StandaloneMesh(), DistributedDatasetConfig(seq_len=10, local_batch_size=1, **options),
         external_step_reader=reader,
     )
+    # Exercise the retained runtime prefetch independently of public configuration.
+    loader._double_buffer = double_buffer
+    return loader
 
 
 def _sampler(size=6, local_batch_size=2):
@@ -387,11 +390,13 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
 
         def metadata_loader() -> Any:
             """Build a metadata-first sampler loader for checkpoint replay."""
-            return build_distributed_dataloader(
+            loader = build_distributed_dataloader(
                 samples, _StandaloneMesh(),
-                DistributedDatasetConfig(seq_len=10, local_batch_size=2, double_buffer=True),
+                DistributedDatasetConfig(seq_len=10, local_batch_size=2),
                 metadata=[SampleMetadata(sample["tokens"]) for sample in samples], batch_sampler=_sampler(),
             )
+            loader._double_buffer = True
+            return loader
 
         for build in (metadata_loader, lambda: _external_loader(double_buffer=True)):
             with self.subTest(build=build):

@@ -65,13 +65,13 @@ def _gather(value: object) -> list:
 
 
 def _run_case(
-        mesh: object, *, metadata_mode: bool, double_buffer: bool, sampler_type: str, data_sharding: bool,
+        mesh: object, *, metadata_mode: bool, sampler_type: str, data_sharding: bool,
 ) -> None:
     rank = dist.get_rank()
     dataset = _Dataset()
     reference = list(_sampler(sampler_type, data_sharding))
     source_sampler = _sampler(sampler_type, data_sharding)
-    config = DistributedDatasetConfig(seq_len=8, local_batch_size=2, double_buffer=double_buffer)
+    config = DistributedDatasetConfig(seq_len=8, local_batch_size=2)
     metadata_options = (
         {"metadata": [_metadata({"id": index}) for index in range(len(dataset))]}
         if metadata_mode else {"metadata_fn": _metadata}
@@ -114,11 +114,9 @@ def _run_case(
         all_reads = _gather(dataset.reads)
         actual_reads = Counter(index for rank_reads in all_reads for index in rank_reads)
         expected_reads = Counter(index for refs in _gather(reference)[::2] for row in refs for index in row)
-        # Checkpointing can replay a prepared metadata read, but never advances membership.
-        if not (metadata_mode and double_buffer):
-            assert actual_reads == expected_reads, (
-                f"Read coverage differs: actual={actual_reads}, expected={expected_reads}"
-            )
+        assert actual_reads == expected_reads, (
+            f"Read coverage differs: actual={actual_reads}, expected={expected_reads}"
+        )
         resumed = build_distributed_dataloader(
             dataset if rank % 2 == 0 else None, mesh, config,
             batch_sampler=_sampler(sampler_type, data_sharding), **metadata_options,
@@ -152,10 +150,8 @@ def test_native_batch_sampler_dp2_tp2_gloo() -> None:
     try:
         mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("dp", "tp"))
         for metadata_mode in (False, True):
-            for double_buffer in (False, True):
-                for sampler_type, data_sharding in (("single", False), ("cyclic", False), ("cyclic", True)):
-                    _run_case(mesh, metadata_mode=metadata_mode, double_buffer=double_buffer,
-                              sampler_type=sampler_type, data_sharding=data_sharding)
+            for sampler_type, data_sharding in (("single", False), ("cyclic", False), ("cyclic", True)):
+                _run_case(mesh, metadata_mode=metadata_mode, sampler_type=sampler_type, data_sharding=data_sharding)
         _run_cost_balance(mesh)
         dist.barrier()
     finally:

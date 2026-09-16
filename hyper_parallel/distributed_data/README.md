@@ -67,10 +67,20 @@ should contain; there is no refill/`attempt` loop.
 
 ## Public API
 
+External applications can bind their source, metadata, collator and CPU field
+policy with `build_distributed_dataset`, then pass that object and a
+`DistributedDatasetConfig` to `build_distributed_dataloader`. With
+`enable_dp_balance=True`, this path automatically performs node-local Gloo
+balancing, double buffering and H2D, and yields ready device microbatches.
+See [dataset-based integration](NODE_LOCAL_BALANCING.md) for the complete
+contract. Existing callback-based and native BatchSampler entries remain
+available without changes.
+
 ```python
 from hyper_parallel.distributed_data import (
     DistributedDatasetConfig,
     SampleMetadata,
+    build_distributed_dataset,
     build_distributed_dataloader,
 )
 ```
@@ -480,7 +490,7 @@ device only for final H2D. Shared metadata mode bypasses payload transport entir
   (or the compatibility Reader API).
 - Enabled node-local balancing retains at most one prefetched step, including
   final H2D. The first step waits for preparation; the original path is synchronous.
-- Gloo control plane and correctness-first framed pickle payloads; online A2A
+- Gloo control plane and pickle payloads; online A2A
   may use Gloo, NCCL, or HCCL.
 - `drop_last=True`; every DP rank receives the same number of non-empty bins.
 - Checkpoints are per rank and include transformed read-ahead payloads. Sample

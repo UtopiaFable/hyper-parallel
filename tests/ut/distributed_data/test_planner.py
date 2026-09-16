@@ -61,6 +61,32 @@ class TestDynamicPackingPlanner(unittest.TestCase):
     """Verify exact-set sample balancing, fallback, overflow, and stability."""
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_enabled_cost_first_balancing_keeps_nonimproving_reference(self) -> None:
+        """Feature: Cost-first LPT planning.
+        Description: Plan skewed and equal-cost selected sample sets.
+        Expectation: Makespan improves when possible, otherwise reference ownership is retained.
+        """
+        planner = DynamicPackingPlanner(
+            data_parallel_size=2, seq_len=10, local_batch_size=1,
+            enable_balancing=True, cost_model=lambda metadata: metadata.cost,
+        )
+        for costs, expected_costs in (((9, 9, 1, 1), [10, 10]), ((1, 1, 1, 1), [2, 2])):
+            with self.subTest(costs=costs):
+                samples = tuple(
+                    _candidate(index, 5, cost=WorkloadCost(llm=cost), reader_rank=index // 2)
+                    for index, cost in enumerate(costs)
+                )
+                selection = _selection(samples, (2, 2))
+                plan = planner.plan(selection, step=0)
+                self.assertEqual([cost.llm for cost in plan.rank_costs], expected_costs)
+                self.assertEqual(set(plan.selected_keys), {sample.key for sample in samples})
+                self.assertEqual(planner.last_sample_costs, {sample.key: sample.metadata.cost for sample in samples})
+                if costs[0] == 1:
+                    self.assertEqual(
+                        tuple(batch[0].sample_keys for batch in plan.local_batches), selection.reference_bins,
+                    )
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_balances_individual_samples_and_conserves_selection(self) -> None:
         """Feature: Sample-level load balancing.
         Description: Place complementary selected samples across data-parallel bins.

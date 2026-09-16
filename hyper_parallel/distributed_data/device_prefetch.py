@@ -295,10 +295,7 @@ class DeviceStepPrefetcher:
         return DevicePrefetchedStep(cpu_micro_batches, device_micro_batches, ready_event, self.device)
 
 
-def _create_device_prefetcher(
-        device: Any = None,
-        move_fn: Callable[[Any, torch.device], Any] | None = None,
-) -> DeviceStepPrefetcher | None:
+def _resolve_device(device: Any = None) -> torch.device:
     """Select the current accelerator unless an explicit CPU flow is requested."""
     if device is None:
         for device_type in ("npu", "cuda"):
@@ -307,8 +304,16 @@ def _create_device_prefetcher(
                 device = torch.device(device_type, accelerator.current_device())
                 break
         else:
-            return None
-    device = torch.device(device)
+            device = "cpu"
+    return torch.device(device)
+
+
+def _create_device_prefetcher(
+        device: Any = None,
+        move_fn: Callable[[Any, torch.device], Any] | None = None,
+) -> DeviceStepPrefetcher | None:
+    """Create producer-owned H2D only when an accelerator is selected."""
+    device = _resolve_device(device)
     if device.type == "cpu":
         return None
     return DeviceStepPrefetcher(device, move_fn=move_fn)

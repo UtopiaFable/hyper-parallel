@@ -36,7 +36,7 @@ def _loader(dataset: object) -> object:
         vlm_loader_target(), datasets=(dataset, None, None), collate_fn=VLMCollator(),
         mesh_context=SimpleNamespace(dp_rank=0, dp_size=1, device_mesh=mesh),
         training_config=SimpleNamespace(micro_batch_size=2, global_batch_size=4, seed=17),
-        data_config={"load_balance": "native_batch_sampler", "distributed_dataloader": {"double_buffer": True}},
+        data_config={"load_balance": "native_batch_sampler"},
         max_seq_len=64, metadata_fn=vlm_sample_metadata,
     )
     return loaders[0]

@@ -15,6 +15,7 @@
 """Tests for Trainer-side asynchronous H2D batch prefetch."""
 
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -27,6 +28,7 @@ from hyper_parallel.distributed_data import (
     SampleMetadata,
     build_distributed_dataloader,
 )
+from hyper_parallel.distributed_data.device_prefetch import DeviceStepPrefetcher
 from tests.common.mark_utils import arg_mark
 
 
@@ -103,6 +105,31 @@ def _fake_accelerator(events: list[tuple[str, object]]) -> SimpleNamespace:
 
 class TestDeviceBatchPrefetcher(unittest.TestCase):
     """Verify copy-stream launch, event ordering, and slot lifecycle."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_producer_prefetch_binds_device_and_hands_off_storage(self) -> None:
+        """Feature: Producer-owned H2D.
+        Description: Stage two steps on one copy stream and consume the first.
+        Expectation: Device binding, copy completion and consumer lifetime are explicit.
+        """
+        events = []
+        accelerator = Mock()
+        accelerator.stream.side_effect = lambda _stream: nullcontext()
+        device_batch = _DeviceBatch(events)
+        with patch.object(torch, "cuda", accelerator), patch(
+                "hyper_parallel.distributed_data.device_prefetch._pin_memory", side_effect=lambda value: value,
+        ):
+            prefetcher = DeviceStepPrefetcher("cuda:0", move_fn=lambda _batch, _device: device_batch)
+            first = prefetcher([{"host": 1}])
+            prefetcher([{"host": 2}])
+            self.assertEqual(accelerator.set_device.call_count, 2)
+            accelerator.Stream.assert_called_once_with(device=torch.device("cuda:0"))
+            self.assertEqual(accelerator.Event.return_value.synchronize.call_count, 2)
+            self.assertIs(first.take_microbatch(0), device_batch)
+            accelerator.current_stream.return_value.wait_event.assert_called_once_with(first.ready_event)
+            self.assertEqual(events, [("record_stream", accelerator.current_stream.return_value)])
+            self.assertEqual(first.device_micro_batches, [None])
+            self.assertEqual(first.cpu_micro_batches, [{"host": 1}])
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_prepares_copies_and_waits_before_returning_batch(self) -> None:
@@ -237,13 +264,13 @@ class TestDeviceBatchPrefetcher(unittest.TestCase):
                 seq_len=8,
                 local_batch_size=1,
                 buffer_size_multiplier=1.0,
-                double_buffer=True,
             ),
             metadata_fn=metadata_fn,
             batch_sampler=build_dataset_batch_sampler(
                 total_samples=2, micro_batch_size=1, global_batch_size=1, dp_world_size=1, dp_rank=0,
             ),
         )
+        loader._double_buffer = True
         events: list[tuple[str, object]] = []
         with patch(
                 "hyper_parallel.distributed_data.device_prefetch._accelerator_module",

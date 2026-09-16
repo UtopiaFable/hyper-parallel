@@ -36,6 +36,9 @@ from hyper_parallel.distributed_data.data_constructor import (
     default_collate_fn,
     default_pack_fn,
 )
+from hyper_parallel.distributed_data.dataset import DistributedDataset
+from hyper_parallel.distributed_data.dataset_dataloader import DatasetDataLoader
+from hyper_parallel.distributed_data.device_prefetch import _resolve_device
 from hyper_parallel.distributed_data.distributed_dataloader import DistributedDataLoader
 from hyper_parallel.distributed_data.cost_model import CostModel
 from hyper_parallel.distributed_data.packed_balancing import LocalBalancingDataLoader, build_local_balancing_dataloader
@@ -113,9 +116,10 @@ class DistributedDatasetConfig:
         pin_memory: Whether sample loader workers pin returned sample memory.
         prefetch_factor: Samples prefetched by each worker.
         persistent_workers: Whether workers persist for the loader lifetime.
-        enable_dp_balance: Opt into node-local cost balancing for external raw
+        enable_dp_balance: Opt into node-local cost balancing for dataset-owned or external raw
             steps, including Gloo exchange, automatic double buffering and H2D.
-            False retains the original metadata-based packing path.
+            False retains the original metadata-based packing path, or preserves
+            source bins when using the dataset facade.
         packing_budgets: Optional per-packed-sequence additive hard limits for
             ``build_local_balancing_dataloader``. Each configured stage must
             occur in every sample's packing_costs. These limits are independent
@@ -818,7 +822,7 @@ def build_distributed_dataloader(
         move_fn: Callable[[Any, Any], Any] | None = None,
         bin_stats_fn: Callable[[Iterable[SampleMetadata]], dict[str, Any]] | None = None,
         max_steps: int | None = None,
-) -> DistributedDataLoader | LocalBalancingDataLoader:
+) -> DistributedDataLoader | LocalBalancingDataLoader | DatasetDataLoader:
     """Build a sample-balanced distributed DataLoader.
 
     Online mode without ``batch_sampler`` requires an external step source or
@@ -835,7 +839,9 @@ def build_distributed_dataloader(
     Complete Dataset outputs are balanced without repacking their contents.
 
     Args:
-        dataset: BatchSampler mode requires a shared mapping Dataset
+        dataset: A build_distributed_dataset result supplies metadata, collation
+            and field placement itself and yields device-ready microbatches.
+            Otherwise, BatchSampler mode requires a shared mapping Dataset
             on Data Constructor ranks. In external-step mode, the Reader owns data
             loading and ``dataset`` may be ``None``. Other ranks may pass the
             same object or ``None``.
@@ -897,11 +903,31 @@ def build_distributed_dataloader(
         epoch; arbitrary worker-side RNG state is not captured. Metadata and
         Dataset lengths must agree across all Data Constructor ranks. Metadata
         entries must describe deterministic, rank-independent Dataset outputs.
-        enable_dp_balance is opt-in and currently requires external_step_source
+        enable_dp_balance is opt-in and requires a DistributedDataset or external_step_source
         and pure DP. That path uses fixed node-local Gloo, LPT and buffered H2D;
         checkpoint/resume remains available only on the original path.
     """
-    if config.enable_dp_balance:
+    if isinstance(dataset, DistributedDataset):
+        if any(value is not None for value in (
+                metadata_fn, metadata, pack_fn, collate_fn, move_fn, bin_stats_fn,
+                batch_sampler, external_step_source, external_step_reader,
+        )) or dataloader_kwargs:
+            raise ValueError("Configure source, metadata, collation and field placement on DistributedDataset.")
+        device = _resolve_device(device)
+        loader = build_local_balancing_dataloader(
+            dataset, mesh, config,
+            metadata_fn=dataset.sample_metadata,
+            pack_fn=dataset.pack,
+            collate_fn=list,
+            model_config=model_config,
+            cost_model=cost_model,
+            device=device,
+            move_fn=dataset.move_to_device,
+            bin_stats_fn=dataset.summarize if dataset.log_fields else None,
+            max_steps=max_steps,
+        )
+        return DatasetDataLoader(dataset, loader, device)
+    if isinstance(config, DistributedDatasetConfig) and config.enable_dp_balance:
         if external_step_source is None or batch_sampler is not None or metadata is not None \
                 or external_step_reader is not None:
             raise ValueError("enable_dp_balance requires external_step_source without a sampler or legacy reader.")
