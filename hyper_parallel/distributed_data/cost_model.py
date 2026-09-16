@@ -57,7 +57,7 @@ def _integer(value: Any, name: str, minimum: int = 1) -> int:
 
 @dataclass(frozen=True)
 class BackboneFlopsConfig:
-    """GLM Transfusion MLA decoder dimensions, independent of model libraries.
+    """Latent-attention decoder dimensions, independent of model libraries.
 
     Only the shared backbone decoder layers are modeled. Diffusion input/output
     stacks, the language-model head, ViT, VAE, and their projectors are excluded.
@@ -111,7 +111,11 @@ class BackboneFlopsConfig:
 
     @classmethod
     def from_model_config(cls, model_config: Any) -> "BackboneFlopsConfig":
-        """Read the final GLM model config after architecture/ablation overrides."""
+        """Read the final model configuration after architecture overrides.
+
+        Args:
+            model_config: Configuration with explicit decoder dimensions and layer types.
+        """
         config = _configuration_dict(model_config)
         text = _configuration_dict(config.get("text_config", config))
         required = (
@@ -120,13 +124,10 @@ class BackboneFlopsConfig:
         )
         missing = [name for name in required if name not in text]
         if missing:
-            raise ValueError(f"GLM MLA backbone cost model is missing configuration fields: {missing}.")
-        layers = _integer(text["num_hidden_layers"], "num_hidden_layers")
+            raise ValueError(f"Backbone cost model is missing configuration fields: {missing}.")
         pattern = text.get("mlp_layer_types")
-        if pattern is None:
-            pattern = ["dense"] + ["sparse"] * (layers - 1)
         if not isinstance(pattern, (list, tuple)):
-            raise ValueError("model_config.text_config.mlp_layer_types must be a list or tuple.")
+            raise ValueError("model_config must provide mlp_layer_types in actual decoder layer order.")
         qk_dim = (
             _integer(text["qk_nope_head_dim"], "qk_nope_head_dim", 0)
             + _integer(text["qk_rope_head_dim"], "qk_rope_head_dim", 0)
@@ -145,18 +146,18 @@ class BackboneFlopsConfig:
 
 
 class DefaultCostModel:
-    """Plan-B-style shape FLOPs for the GLM shared MLA/MoE backbone.
+    """Shape-based FLOPs for a shared latent-attention and expert backbone.
 
     Args:
-        model_config: Final GLM config or :class:`BackboneFlopsConfig`. ``None``
-            retains the metadata-provided costs for existing non-GLM callers.
+        model_config: Final model configuration or :class:`BackboneFlopsConfig`.
+            Required to derive the backbone's arithmetic workload.
         training_multiplier: Constant forward-to-training FLOPs proxy: 1 for
             forward, 3 for forward/backward, or 4 for full-layer recomputation.
             It does not change balancing decisions when shared by all samples.
 
     Note:
         MAC=2 FLOPs. The attention area per independent raw item is
-        ``P**2 / 2 + D * (P + D)``; HY blockmask adds half the square of each
+        ``P**2 / 2 + D * (P + D)``; blockwise attention adds half the square of each
         conditional-image placeholder run. ``P`` includes control tokens and
         conditional-image tokens, not just natural-language text. Costs add
         across packed items; there is no attention between different items.
@@ -167,8 +168,15 @@ class DefaultCostModel:
         excluded. This is theoretical arithmetic, not a latency predictor.
     """
 
-    def __init__(self, model_config: Any = None, *, training_multiplier: float = 3.0) -> None:
-        """Validate the training multiplier and compile configured backbone costs."""
+    def __init__(self, model_config: Any, *, training_multiplier: float = 3.0) -> None:
+        """Compile workload coefficients from the effective decoder configuration.
+
+        Args:
+            model_config: Explicit decoder dimensions and attention layout.
+            training_multiplier: Forward-to-training arithmetic scale.
+        """
+        if model_config is None:
+            raise ValueError("DefaultCostModel requires model_config; provide it or supply a custom cost_model.")
         if (
                 not isinstance(training_multiplier, (int, float))
                 or isinstance(training_multiplier, bool)
@@ -178,17 +186,15 @@ class DefaultCostModel:
             raise ValueError("training_multiplier must be finite and positive.")
         self.training_multiplier = float(training_multiplier)
         self.config = (
-            model_config if isinstance(model_config, BackboneFlopsConfig) or model_config is None
+            model_config if isinstance(model_config, BackboneFlopsConfig)
             else BackboneFlopsConfig.from_model_config(model_config)
         )
         self.linear_flops_per_token = 0
         self.attention_flops_per_pair = 0
-        if self.config is not None:
-            self._compile_coefficients()
-        identity = {"config": asdict(self.config) if self.config is not None else None,
-                    "training_multiplier": self.training_multiplier}
+        self._compile_coefficients()
+        identity = {"config": asdict(self.config), "training_multiplier": self.training_multiplier}
         digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:16]
-        self.model_id = f"glm-backbone-flops-v1-{digest}" if self.config is not None else "metadata-passthrough-v1"
+        self.model_id = f"backbone-flops-v1-{digest}"
 
     def _compile_coefficients(self) -> None:
         config = self.config
@@ -216,9 +222,11 @@ class DefaultCostModel:
         self.attention_flops_per_pair = 2 * config.num_hidden_layers * heads * (qk_dim + config.v_head_dim)
 
     def forward_flops(self, metadata: SampleMetadata) -> float:
-        """Estimate decoder forward FLOPs from CPU-only per-raw-item metadata."""
-        if self.config is None:
-            raise ValueError("forward_flops requires a backbone model_config.")
+        """Estimate decoder forward FLOPs from CPU-only per-raw-item metadata.
+
+        Args:
+            metadata: One independent item's token counts and attention segments.
+        """
         prefix = _integer(metadata.features.get("P"), "metadata.features['P']", 0)
         diffusion = _integer(metadata.features.get("D"), "metadata.features['D']", 0)
         if prefix + diffusion != metadata.pack_tokens:
@@ -229,7 +237,7 @@ class DefaultCostModel:
         if self.config.attn_block_mode == "blockmask":
             runs = metadata.features.get("cond_image_token_lengths")
             if not isinstance(runs, (list, tuple)):
-                raise ValueError("HY blockmask requires cond_image_token_lengths (an empty sequence for no images).")
+                raise ValueError("Blockwise attention requires cond_image_token_lengths (empty for no images).")
             lengths = [_integer(length, "conditional-image run length") for length in runs]
             if sum(lengths) > prefix:
                 raise ValueError("Conditional-image run lengths cannot exceed the prefix token count P.")
@@ -238,26 +246,21 @@ class DefaultCostModel:
 
     def __call__(self, metadata: SampleMetadata) -> WorkloadCost:
         """Return backbone-only workload without changing physical packing caps."""
-        if self.config is None:
-            return metadata.cost
         return WorkloadCost(llm=self.training_multiplier * self.forward_flops(metadata))
 
 
-def resolve_cost_model_id(cost_model: CostModel | None, cost_model_id: str | None) -> str | None:
-    """Validate a cost callback and its explicit distributed/checkpoint identity.
+def resolve_cost_model(cost_model: CostModel | None, model_config: Any = None) -> CostModel:
+    """Use an explicit callback or construct the default from model dimensions.
 
-    Custom identities must change whenever coefficients or semantics change.
-    Function names alone cannot distinguish different closure/config values.
+    Args:
+        cost_model: Optional user-supplied workload callback.
+        model_config: Required backbone configuration when the callback is absent.
     """
     if cost_model is None:
-        if cost_model_id is not None:
-            raise ValueError("cost_model_id requires a custom cost_model.")
-        return None
+        return DefaultCostModel(model_config)
     if not callable(cost_model):
         raise ValueError("cost_model must be callable: SampleMetadata -> WorkloadCost.")
-    if not isinstance(cost_model_id, str) or not cost_model_id.strip():
-        raise ValueError("A custom cost_model requires a non-empty, stable cost_model_id including its configuration.")
-    return cost_model_id
+    return cost_model
 
 
 __all__ = ["BackboneFlopsConfig", "CostModel", "DefaultCostModel"]

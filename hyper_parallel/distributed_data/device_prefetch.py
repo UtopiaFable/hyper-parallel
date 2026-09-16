@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
 import torch  # pylint: disable=forbidden-backend-import
@@ -249,9 +248,6 @@ class DeviceStepPrefetcher:
             device: Any,
             *,
             move_fn: Callable[[Any, torch.device], Any] | None = None,
-            pin_memory: bool = False,
-            pin_fn: Callable[[Any], Any] | None = None,
-            profile_context_fn: Callable[[], AbstractContextManager] | None = None,
     ) -> None:
         """Configure final input transfer without allocating a device stream.
 
@@ -259,18 +255,12 @@ class DeviceStepPrefetcher:
             device: Target CUDA or NPU device, independent of payload transport.
             move_fn: Optional per-microbatch field mapping/H2D callback. The
                 default recursively moves tensors and standard containers.
-            pin_memory: Re-pin final packed inputs before H2D when enabled.
-            pin_fn: Optional per-microbatch pin policy, matching ``move_fn``.
-            profile_context_fn: Optional application profiling context factory.
         """
         self.device = torch.device(device)
         if self.device.type not in ("cuda", "npu"):
             raise ValueError("DeviceStepPrefetcher requires a CUDA or NPU device.")
         self._accelerator = _accelerator_module(self.device)
-        self.pin_memory = pin_memory
         self._move_fn = _move_to_device if move_fn is None else move_fn
-        self._pin_fn = _pin_memory if pin_fn is None else pin_fn
-        self._profile_context_fn = nullcontext if profile_context_fn is None else profile_context_fn
         self._copy_stream = None
 
     def __call__(self, cpu_micro_batches: list[Any]) -> DevicePrefetchedStep:
@@ -288,25 +278,40 @@ class DeviceStepPrefetcher:
         accelerator.set_device(self.device)
         if self._copy_stream is None:
             self._copy_stream = accelerator.Stream(device=self.device)
-        with self._profile_context_fn():
-            staging = (
-                [self._pin_fn(micro_batch) for micro_batch in cpu_micro_batches]
-                if self.pin_memory else cpu_micro_batches
-            )
-            device_micro_batches = []
-            try:
-                with accelerator.stream(self._copy_stream):
-                    for micro_batch in staging:
-                        device_micro_batches.append(self._move_fn(micro_batch, self.device))
-                    ready_event = accelerator.Event()
-                    ready_event.record(self._copy_stream)
-                ready_event.synchronize()
-            except BaseException:
-                # Earlier copies may still read pinned staging when a later
-                # launch fails. Drain only this stream before releasing sources.
-                self._copy_stream.synchronize()
-                raise
+        staging = [_pin_memory(micro_batch) for micro_batch in cpu_micro_batches]
+        device_micro_batches = []
+        try:
+            with accelerator.stream(self._copy_stream):
+                for micro_batch in staging:
+                    device_micro_batches.append(self._move_fn(micro_batch, self.device))
+                ready_event = accelerator.Event()
+                ready_event.record(self._copy_stream)
+            ready_event.synchronize()
+        except BaseException:
+            # Earlier copies may still read pinned staging when a later
+            # launch fails. Drain only this stream before releasing sources.
+            self._copy_stream.synchronize()
+            raise
         return DevicePrefetchedStep(cpu_micro_batches, device_micro_batches, ready_event, self.device)
 
 
-__all__ = ["DeviceBatchPrefetcher", "DevicePrefetchedStep", "DeviceStepPrefetcher"]
+def _create_device_prefetcher(
+        device: Any = None,
+        move_fn: Callable[[Any, torch.device], Any] | None = None,
+) -> DeviceStepPrefetcher | None:
+    """Select the current accelerator unless an explicit CPU flow is requested."""
+    if device is None:
+        for device_type in ("npu", "cuda"):
+            accelerator = getattr(torch, device_type, None)
+            if accelerator is not None and accelerator.is_available():
+                device = torch.device(device_type, accelerator.current_device())
+                break
+        else:
+            return None
+    device = torch.device(device)
+    if device.type == "cpu":
+        return None
+    return DeviceStepPrefetcher(device, move_fn=move_fn)
+
+
+__all__ = ["DeviceBatchPrefetcher"]

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from multiprocessing.context import BaseContext
 from typing import Any
@@ -37,6 +37,8 @@ from hyper_parallel.distributed_data.data_constructor import (
     default_pack_fn,
 )
 from hyper_parallel.distributed_data.distributed_dataloader import DistributedDataLoader
+from hyper_parallel.distributed_data.cost_model import CostModel
+from hyper_parallel.distributed_data.packed_balancing import LocalBalancingDataLoader, build_local_balancing_dataloader
 from hyper_parallel.distributed_data.external_step import ExternalStepAdapter, ExternalStepSource
 from hyper_parallel.distributed_data.planner import DynamicPackingPlanner, OversizedPolicy
 from hyper_parallel.distributed_data.schema import PackingConstraints, SampleMetadata
@@ -111,13 +113,9 @@ class DistributedDatasetConfig:
         pin_memory: Whether sample loader workers pin returned sample memory.
         prefetch_factor: Samples prefetched by each worker.
         persistent_workers: Whether workers persist for the loader lifetime.
-        double_buffer: Whether to prepare the next distributed local batch in
-            a background thread while the trainer consumes the current batch.
-        cpu_backend: torch.distributed backend for metadata/control and MP
-            batch broadcast.
-        payload_backend: Optional payload A2A backend. With an
-            accelerator communication device, the WORLD backend is used by default;
-            otherwise this falls back to ``cpu_backend``.
+        enable_dp_balance: Opt into node-local cost balancing for external raw
+            steps, including Gloo exchange, automatic double buffering and H2D.
+            False retains the original metadata-based packing path.
         packing_budgets: Optional per-packed-sequence additive hard limits for
             ``build_local_balancing_dataloader``. Each configured stage must
             occur in every sample's packing_costs. These limits are independent
@@ -139,10 +137,8 @@ class DistributedDatasetConfig:
     pin_memory: bool = False
     prefetch_factor: int | None = None
     persistent_workers: bool = False
-    double_buffer: bool = False
+    enable_dp_balance: bool = False
     min_balance_gain: float = 0.0
-    cpu_backend: str = "gloo"
-    payload_backend: str | None = None
     packing_budgets: dict[str, float] | None = None
 
     def __post_init__(self) -> None:
@@ -154,7 +150,6 @@ class DistributedDatasetConfig:
         self._validate_rank_tuple(self.dataset_reader_ranks, "dataset_reader_ranks")
         self._validate_name_tuple(self.dp_dim_names, "dp_dim_names")
         self._validate_planner_rank()
-        self._validate_backends()
         PackingConstraints(self.seq_len, self.oversized_policy, self.packing_budgets)
 
     def _validate_integer_fields(self) -> None:
@@ -183,7 +178,7 @@ class DistributedDatasetConfig:
                 "dataset_already_sharded",
                 "drop_last",
                 "shuffle",
-                "double_buffer",
+                "enable_dp_balance",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be boolean.")
@@ -207,17 +202,6 @@ class DistributedDatasetConfig:
                 or self.planner_rank < 0
         ):
             raise ValueError("planner_rank must be a non-negative integer or None.")
-
-    def _validate_backends(self) -> None:
-        if not isinstance(self.cpu_backend, str) or not self.cpu_backend:
-            raise ValueError("cpu_backend must be a non-empty string.")
-        normalized_cpu_backend = self.cpu_backend.lower()
-        if "hccl" in normalized_cpu_backend or "nccl" in normalized_cpu_backend:
-            raise ValueError("cpu_backend must support CPU tensors and object collectives; use Gloo, not HCCL/NCCL.")
-        if self.payload_backend is not None and (
-                not isinstance(self.payload_backend, str) or not self.payload_backend
-        ):
-            raise ValueError("payload_backend must be a non-empty string or None.")
 
     @staticmethod
     def _validate_rank_tuple(value: tuple[int, ...] | None, name: str) -> None:
@@ -825,11 +809,16 @@ def build_distributed_dataloader(
         dataloader_kwargs: Mapping[str, Any] | None = None,
         pack_fn: Callable[[Sequence[Any], int], Any] | None = None,
         collate_fn: Callable[[Sequence[Any]], Any] | None = None,
-        communication_device: Any = None,
+        device: Any = None,
         batch_sampler: Any = None,
         external_step_reader: Any | None = None,
         external_step_source: ExternalStepSource | None = None,
-) -> DistributedDataLoader:
+        model_config: Any = None,
+        cost_model: CostModel | None = None,
+        move_fn: Callable[[Any, Any], Any] | None = None,
+        bin_stats_fn: Callable[[Iterable[SampleMetadata]], dict[str, Any]] | None = None,
+        max_steps: int | None = None,
+) -> DistributedDataLoader | LocalBalancingDataLoader:
     """Build a sample-balanced distributed DataLoader.
 
     Online mode without ``batch_sampler`` requires an external step source or
@@ -868,9 +857,9 @@ def build_distributed_dataloader(
             default preserves each planned bin as a raw-sample tuple.
         collate_fn: Optionally collate ``local_batch_size`` packed sequences.
             The default preserves the bins as a tuple.
-        communication_device: Optional rank-local device used by payload A2A.
-            With NCCL/HCCL this is normally ``cuda:<local_rank>`` or
-            ``npu:<local_rank>``. Omit it for CPU/Gloo payload exchange.
+        device: Rank-local training device. Enabled node-local balancing uses
+            it only for final H2D; metadata and raw samples always use Gloo.
+            The original path retains its device payload transport.
         batch_sampler: Optional native HP BatchSampler. Supply the rank-local
             sampler on every rank; only each DP Constructor advances it. Its
             next yield fixes local sample membership, with no second stride,
@@ -893,16 +882,45 @@ def build_distributed_dataloader(
             epoch methods. HP supplies metadata, payload caching, commit, packing,
             collation, and distributed placement through ``metadata_fn``,
             ``pack_fn``, and ``collate_fn``.
+        model_config: Effective backbone dimensions. With enable_dp_balance,
+            the default cost model is constructed from this configuration.
+        cost_model: Optional user workload callback replacing the default.
+        move_fn: Enabled-path H2D field mapping; retain CPU-only metadata here.
+        bin_stats_fn: Optional per-bin counters in the enabled rank-zero log.
+        max_steps: Enabled-path step limit, including speculative prefetch.
 
     Returns:
-        Stateful collective iterator yielding constructed local batches.
+        Collective iterator yielding constructed local batches.
 
     Note:
         Checkpoint replay requires a deterministic online stream for a given
         epoch; arbitrary worker-side RNG state is not captured. Metadata and
         Dataset lengths must agree across all Data Constructor ranks. Metadata
         entries must describe deterministic, rank-independent Dataset outputs.
+        enable_dp_balance is opt-in and currently requires external_step_source
+        and pure DP. That path uses fixed node-local Gloo, LPT and buffered H2D;
+        checkpoint/resume remains available only on the original path.
     """
+    if config.enable_dp_balance:
+        if external_step_source is None or batch_sampler is not None or metadata is not None \
+                or external_step_reader is not None:
+            raise ValueError("enable_dp_balance requires external_step_source without a sampler or legacy reader.")
+        if dataloader_kwargs:
+            raise ValueError("Configure source worker options on external_step_source, not the balancing wrapper.")
+        return build_local_balancing_dataloader(
+            external_step_source,
+            mesh,
+            config,
+            metadata_fn=metadata_fn,
+            pack_fn=default_pack_fn if pack_fn is None else pack_fn,
+            collate_fn=default_collate_fn if collate_fn is None else collate_fn,
+            model_config=model_config,
+            cost_model=cost_model,
+            device=device,
+            move_fn=move_fn,
+            bin_stats_fn=bin_stats_fn,
+            max_steps=max_steps,
+        )
     return _build_distributed_dataloader_impl(
         dataset,
         mesh,
@@ -912,7 +930,7 @@ def build_distributed_dataloader(
         dataloader_kwargs=dataloader_kwargs,
         pack_fn=pack_fn,
         collate_fn=collate_fn,
-        communication_device=communication_device,
+        communication_device=device,
         batch_sampler=batch_sampler,
         external_step_reader=external_step_reader,
         external_step_source=external_step_source,
@@ -963,8 +981,8 @@ def _build_distributed_dataloader_impl(
         state.topology,
         state.dataset_reader_ranks,
         state.planner_rank,
-        cpu_backend=config.cpu_backend,
-        payload_backend=config.payload_backend,
+        cpu_backend="gloo",
+        payload_backend=None,
         communication_device=state.communication_device,
         enable_payload_exchange=not state.metadata_mode,
     )
@@ -987,7 +1005,7 @@ def _build_distributed_dataloader_impl(
             communication_device=state.communication_device,
         ),
         model_transport=ModelParallelTransport(state.topology, groups),
-        double_buffer=config.double_buffer,
+        double_buffer=False,
         config_fingerprint=state.config_fingerprint,
     )
 

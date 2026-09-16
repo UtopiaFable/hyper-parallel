@@ -512,7 +512,7 @@ class DistributedDataLoader(Iterator[Any]):
         if self._metadata_mode:
             return self._produce_metadata_batch(plan)
 
-        # VeOmni's external reader has already selected and packed this exact
+        # The external reader has already selected and packed this exact
         # step.  Reuse it when balancing kept every bin on its canonical owner;
         # moved steps continue through the normal payload exchange.
         canonical_match = False
@@ -607,7 +607,7 @@ class DistributedDataLoader(Iterator[Any]):
     def _select_external_step(self, snapshots: list[_ReaderSnapshot]) -> StepSampleSelection | None:
         """Freeze the exact sample set emitted by an external legacy producer.
 
-        Each Dataset Reader has already run its local VeOmni selector for the
+        Each Dataset Reader has already run its local sample selector for the
         current step.  We preserve that union and let the HP planner only
         change target-rank placement.  The original metadata groups are used to
         validate that every local producer emitted the expected number of

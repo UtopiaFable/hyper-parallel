@@ -18,18 +18,15 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from threading import Thread
 from typing import TYPE_CHECKING, Any
 
-import torch  # pylint: disable=forbidden-backend-import
-
 from hyper_parallel.distributed_data.balance_logging import log_balance_stats
-from hyper_parallel.distributed_data.cost_model import CostModel, resolve_cost_model_id
-from hyper_parallel.distributed_data.device_prefetch import DeviceStepPrefetcher
-from hyper_parallel.distributed_data.locality import create_locality_groups
-from hyper_parallel.distributed_data.planner import LPTPackingPlanner
+from hyper_parallel.distributed_data.cost_model import CostModel, resolve_cost_model
+from hyper_parallel.distributed_data.device_prefetch import DeviceStepPrefetcher, _create_device_prefetcher
+from hyper_parallel.distributed_data.locality import _create_locality_groups
+from hyper_parallel.distributed_data.planner import DynamicPackingPlanner
 from hyper_parallel.distributed_data.schema import (
     BufferedSampleMetadata,
     DistributedPackingPlan,
@@ -64,7 +61,6 @@ class _LocalBalancingIterator(Iterator[Any]):
         self._thread: Thread | None = None
         self._result: _LocalBatch | None = None
         self._error: BaseException | None = None
-        self._stream = None
 
     def __next__(self) -> Any:
         """Deliver the current batch and prepare the following complete step."""
@@ -72,7 +68,7 @@ class _LocalBalancingIterator(Iterator[Any]):
             self.finished = True
             raise StopIteration
         try:
-            if self._loader.config.double_buffer:
+            if self._loader.enable_balancing:
                 if self._thread is None:
                     self._start_prefetch()
                 self.wait_for_prefetch()
@@ -90,7 +86,7 @@ class _LocalBalancingIterator(Iterator[Any]):
             raise
         self._step += 1
         self._loader.last_balance_stats = result.stats
-        if self._loader.config.double_buffer and not self._limit_reached():
+        if self._loader.enable_balancing and not self._limit_reached():
             self._start_prefetch()
         return self._loader._deliver_batch(result, self._step)
 
@@ -112,19 +108,7 @@ class _LocalBalancingIterator(Iterator[Any]):
 
     def _run_prefetch(self) -> None:
         try:
-            transport = self._loader._transport
-            device = transport.communication_device if transport is not None else None
-            context = nullcontext()
-            if device is not None and device.type in ("cuda", "npu"):
-                accelerator = getattr(torch, device.type)
-                accelerator.set_device(device)
-                if self._stream is None:
-                    self._stream = accelerator.Stream(device=device)
-                context = accelerator.stream(self._stream)
-            # Include the source read, metadata, planning, H2D, A2A, D2H and
-            # CPU pack/collate in the same transaction and producer stream.
-            with context:
-                self._result = self._collect_batch()
+            self._result = self._collect_batch()
         except BaseException as exc:
             self._error = exc
 
@@ -163,7 +147,6 @@ class LocalBalancingDataLoader:
             planner: Any,
             transport: DataPlaneTransport | None,
             global_rank: int,
-            balancing_scope: str,
             enable_balancing: bool,
             bin_stats_fn: Callable[[Iterable[SampleMetadata]], dict[str, Any]] | None = None,
             device_prefetch: DeviceStepPrefetcher | None = None,
@@ -176,7 +159,6 @@ class LocalBalancingDataLoader:
         self.local_dataloader = local_dataloader
         self.config = config
         self.group_ranks = transport.ranks if transport is not None else (global_rank,)
-        self.balancing_scope = balancing_scope
         self.enable_balancing = enable_balancing
         self.max_steps = max_steps
         self.prefetches_to_device = device_prefetch is not None
@@ -210,7 +192,11 @@ class LocalBalancingDataLoader:
         return next(self._iterator)
 
     def set_epoch(self, epoch: int) -> None:
-        """Forward epoch selection to the local source before starting iteration."""
+        """Forward epoch selection to the local source before starting iteration.
+
+        Args:
+            epoch: Source epoch to start.
+        """
         if self._iterator is not None:
             self._iterator.close()
             self._iterator = None
@@ -224,7 +210,11 @@ class LocalBalancingDataLoader:
         raise NotImplementedError("Local balancing does not yet support dataloader checkpoint/resume.")
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
-        """Reject restoring incomplete locality/source state."""
+        """Reject restoring incomplete locality/source state.
+
+        Args:
+            state: Unsupported loader checkpoint.
+        """
         del state
         raise NotImplementedError("Local balancing does not yet support dataloader checkpoint/resume.")
 
@@ -318,6 +308,8 @@ class LocalBalancingDataLoader:
         return _LocalBatch(batch, stats)
 
     def _read_step(self, raw_bins: Sequence[Sequence[Any]], step: int) -> tuple[tuple[Any, ...], dict[SampleKey, Any]]:
+        if len(raw_bins) != self.config.local_batch_size or any(not raw_bin for raw_bin in raw_bins):
+            raise ValueError("Each source step must contain local_batch_size non-empty raw-sample bins.")
         key_bins = []
         entries = []
         payloads = {}
@@ -347,7 +339,7 @@ class LocalBalancingDataLoader:
         if self._global_rank == self._transport.planner_rank:
             selection = self._selection(gathered)
             plan = self._planner.plan(selection, step=step)
-            stats = self._statistics(plan, step, gathered)
+            stats = self._statistics(plan, step)
             if self._global_rank == 0:
                 stats.update(self._bin_statistics(gathered, plan))
             result = (plan, stats)
@@ -362,10 +354,9 @@ class LocalBalancingDataLoader:
             for _, entries in gathered
             for key, metadata in entries
         }
-        cost_by_key = {key: metadata.cost.llm for key, metadata in metadata_by_key.items()}
+        cost_by_key = {key: cost.llm for key, cost in self._planner.last_sample_costs.items()}
         before = []
-        for key_bins, entries in gathered:
-            metadata_by_key = dict(entries)
+        for key_bins, _ in gathered:
             before.append(tuple(
                 {
                     **(self._bin_stats_fn(metadata_by_key[key] for key in keys) if self._bin_stats_fn else {}),
@@ -391,7 +382,7 @@ class LocalBalancingDataLoader:
         return {"bins_before": tuple(before), "bins_after": after}
 
     def _statistics(
-            self, plan: DistributedPackingPlan, step: int, gathered: Sequence[Any],
+            self, plan: DistributedPackingPlan, step: int,
     ) -> dict[str, Any]:
         """Count cross-rank raw-sample transfers, excluding locally retained samples."""
         before = [0.0] * len(self.group_ranks)
@@ -400,17 +391,11 @@ class LocalBalancingDataLoader:
         recv_samples = [0] * len(self.group_ranks)
         moved = 0
         source_indices = {rank: index for index, rank in enumerate(self.group_ranks)}
-        sample_costs = {
-            key: metadata.cost.llm
-            for _, entries in gathered
-            for key, metadata in entries
-        }
+        sample_costs = {key: cost.llm for key, cost in self._planner.last_sample_costs.items()}
         for data_rank, local_batch in enumerate(plan.local_batches):
             for packing_bin in local_batch:
                 for key in packing_bin.sample_keys:
                     source_index = source_indices[key.reader_rank]
-                    # The plan carries placement, while source metadata carries
-                    # the cost estimate used for diagnostics.
                     before[source_index] += sample_costs[key]
                     after[data_rank] += sample_costs[key]
                     if source_index != data_rank:
@@ -420,8 +405,8 @@ class LocalBalancingDataLoader:
         mean = sum(before) / len(before)
         return {
             "step": step,
-            "scope": self.balancing_scope,
-            "objective": getattr(self._planner, "objective", "custom"),
+            "scope": "node",
+            "objective": "makespan",
             "group_ranks": self.group_ranks,
             "cost_before": tuple(before),
             "cost_after": tuple(after),
@@ -443,80 +428,45 @@ def build_local_balancing_dataloader(
         metadata_fn: Callable[[Any], SampleMetadata],
         pack_fn: Callable[[Sequence[Any], int], Any],
         collate_fn: Callable[[Sequence[Any]], Any] = list,
+        model_config: Any = None,
         cost_model: CostModel | None = None,
-        cost_model_id: str | None = None,
-        balancing_scope: str = "node",
-        balancing_objective: str = "balance",
-        node_id: str | int | None = None,
-        communication_device: Any = None,
-        balancing_algorithm: Any = None,
-        enable_balancing: bool = False,
+        device: Any = None,
+        move_fn: Callable[[Any, Any], Any] | None = None,
         bin_stats_fn: Callable[[Iterable[SampleMetadata]], dict[str, Any]] | None = None,
-        device_prefetch: DeviceStepPrefetcher | None = None,
         max_steps: int | None = None,
-        balance_stats_callback: Callable[[dict[str, Any], int, int | None], None] | None = log_balance_stats,
 ) -> LocalBalancingDataLoader:
-    """Wrap native online packing with local metadata planning and raw-sample A2A.
+    """Build the fixed node-local balancing pipeline over complete raw steps.
 
     Args:
-        local_dataloader: Each yield is exactly ``config.local_batch_size``
-            non-empty lists of transformed, uncollated raw samples. Native
-            sampler, dataset transforms, worker settings, and buffering remain
-            owned by this source. Its packs freeze current-step membership.
-        mesh: Full named training mesh, with model parallel dimensions equal to 1.
-        config: Sequence capacity, local pack count, hard stage budgets, DP
-            dimension names and communication backends. Reader/worker/buffering
-            settings are owned by ``local_dataloader``, not recreated here.
-        metadata_fn: CPU raw-sample callback returning SampleMetadata.
-        pack_fn: Existing task pack/collator called with received samples and seq_len.
-        collate_fn: Assemble per-pack outputs into the trainer's local step format.
-        cost_model: Optional deterministic workload estimate used by the planner.
-        cost_model_id: Stable identity required when supplying a custom cost model.
-        balancing_scope: ``node`` or actual named ``hsdp_shard`` mesh group.
-        balancing_objective: ``balance`` minimizes DP load variance; ``makespan``
-            prioritizes maximum predicted load, then variance. Both retain the
-            original layout unless the selected objective improves.
-        node_id: Optional override for node grouping; otherwise launcher/hostname.
-        communication_device: Device used by the existing payload transport.
-        balancing_algorithm: Optional planner instance exposing
-            ``plan(StepSampleSelection, step=...)``; defaults to capacity-aware LPT.
-            Custom planners own sample conservation, packing feasibility, and
-            trainer/collective dimensions; this wrapper directly routes their output.
-        enable_balancing: Opt-in switch. When false, preserve native packs and
-            skip group creation, metadata extraction, planning and communication.
-        bin_stats_fn: Optional CPU-only, read-only callback summarizing an iterable
-            of sample metadata into a small serializable dictionary per bin. Runs
-            only on rank zero, for original and accepted layouts; results are
-            included in its node's existing statistics broadcast. The loader adds
-            reserved ``samples``, ``seq_len`` and ``cost`` fields. Cost sums planner-estimated ``WorkloadCost.llm``
-            for the bin, in the active cost model's units. Ignored when balancing
-            is disabled. Does not change costs, placement, or communication count.
-        device_prefetch: Optional final H2D stage, run after collation on the
-            existing producer when double buffering is enabled. Iterator yields
-            keep their Host view for metering; use ``take_device_microbatch``
-            immediately before training consumes each staged microbatch.
-        max_steps: Optional per-iterator step limit. No prefetch starts another
-            step once this limit is reached.
-        balance_stats_callback: Optional application log callback receiving
-            ``(stats, one_based_step, max_steps)`` on global rank zero only,
-            in the consuming thread, not DataLoader workers. Defaults to the
-            built-in DP layout/movement/cost log; ``None`` disables logging.
-            No extra statistics communication is added.
+        local_dataloader: Each yield contains exactly local_batch_size non-empty
+            raw-sample bins. The source owns sampling and worker prefetch.
+        mesh: WORLD-covering named mesh with model-parallel dimensions of size one.
+        config: Packing limits and the enable_dp_balance opt-in switch.
+        metadata_fn: CPU-only per-sample metadata and cost features.
+        pack_fn: Construct one packed sequence from its assigned raw samples.
+        collate_fn: Assemble the local step as a sequence of microbatches.
+        model_config: Effective backbone dimensions for the default FLOPs model.
+            Required when balancing is enabled and cost_model is omitted.
+        cost_model: Optional user estimate replacing the default cost model.
+        device: Training device; defaults to the current NPU or CUDA device.
+            CPU-only execution keeps batches on the host.
+        move_fn: Optional per-microbatch tensor mapping to the training device;
+            use it to retain fields that must stay on CPU.
+        bin_stats_fn: Optional CPU-only per-bin counters for the rank-zero log.
+        max_steps: Stop before prefetching beyond the requested training steps.
 
     Returns:
-        Iterator preserving local microbatch count while balancing raw samples.
+        A local-step loader. Enabled balancing always uses node-local Gloo,
+        cost-first LPT, automatic one-step buffering and final H2D prefetch.
+        Disabled balancing preserves source packs without metadata or exchanges.
 
     Note:
-        Double buffering starts the next full step automatically before returning
-        the current batch (``ori`` timing); no model hooks or delayed trigger are needed.
-        No checkpoint/resume is provided in this first version. Across different
-        locality domains and within each domain, all ranks must consume the same
-        number of steps. Source exhaustion and errors are not synchronized;
-        a rank-local failure can leave peers waiting for the process-group timeout.
+        All ranks must consume the same number of steps. Checkpoint/resume and
+        nontrivial model parallelism are not supported by this opt-in path.
+        The iterator yields CPU views for metering; take_device_microbatch()
+        hands the staged device view to training without another transfer.
     """
-    if not isinstance(enable_balancing, bool):
-        raise ValueError("enable_balancing must be boolean.")
-    if not enable_balancing:
+    if not config.enable_dp_balance:
         topology = DataTopology.from_mesh(mesh, dp_dim_names=config.dp_dim_names)
         return LocalBalancingDataLoader(
             local_dataloader,
@@ -527,63 +477,46 @@ def build_local_balancing_dataloader(
             planner=None,
             transport=None,
             global_rank=topology.global_rank,
-            balancing_scope=balancing_scope,
             enable_balancing=False,
-            bin_stats_fn=bin_stats_fn,
-            device_prefetch=device_prefetch,
             max_steps=max_steps,
-            balance_stats_callback=balance_stats_callback,
         )
+
     error = None
     identity = None
+    device_prefetch = None
     try:
-        effective_cost_id = resolve_cost_model_id(cost_model, cost_model_id)
-        if balancing_objective not in ("balance", "makespan"):
-            raise ValueError("balancing_objective must be 'balance' or 'makespan'.")
-        if balancing_algorithm is not None and balancing_objective != "balance":
-            raise ValueError("Configure the objective on the custom balancing_algorithm itself.")
-        if not callable(metadata_fn) or not callable(pack_fn) or not callable(collate_fn):
+        cost_model = resolve_cost_model(cost_model, model_config)
+        device_prefetch = _create_device_prefetcher(device, move_fn)
+        if not all(callable(callback) for callback in (metadata_fn, pack_fn, collate_fn)):
             raise ValueError("metadata_fn, pack_fn and collate_fn must be callable.")
         if not hasattr(local_dataloader, "__iter__"):
             raise ValueError("local_dataloader must be iterable.")
-        if balancing_algorithm is not None and not callable(getattr(balancing_algorithm, "plan", None)):
-            raise ValueError("balancing_algorithm must expose plan(selection, step=...).")
         if config.dataset_reader_ranks is not None or config.planner_rank is not None:
-            raise ValueError("Local balancing uses every scope rank as reader and its minimum rank as planner.")
+            raise ValueError("Node-local balancing assigns readers and planners automatically.")
         PackingConstraints(config.seq_len, config.oversized_policy, config.packing_budgets)
         identity = json.dumps({
             "config": asdict(config),
-            "cost_model_id": effective_cost_id,
-            "balancing_objective": balancing_objective,
+            "cost_model": getattr(cost_model, "model_id", type(cost_model).__qualname__),
             "max_steps": max_steps,
-            "device_prefetch": device_prefetch is not None,
-            "algorithm": None if balancing_algorithm is None else (
-                type(balancing_algorithm).__module__ + "." + type(balancing_algorithm).__qualname__
-            ),
+            "device_type": None if device_prefetch is None else device_prefetch.device.type,
         }, sort_keys=True)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
-    topology, groups = create_locality_groups(
+    topology, groups = _create_locality_groups(
         mesh,
-        balancing_scope=balancing_scope,
-        node_id=node_id,
-        dp_dim_names=getattr(config, "dp_dim_names", None),
-        cpu_backend=getattr(config, "cpu_backend", "gloo"),
-        payload_backend=getattr(config, "payload_backend", None),
-        communication_device=communication_device,
+        dp_dim_names=config.dp_dim_names,
         build_identity=identity,
         local_error=error,
     )
-    transport = DataPlaneTransport(groups, topology.global_rank, communication_device)
-    planner = balancing_algorithm if balancing_algorithm is not None else LPTPackingPlanner(
+    planner = DynamicPackingPlanner(
         data_parallel_size=len(groups.data_plane_ranks),
         seq_len=config.seq_len,
         local_batch_size=config.local_batch_size,
         oversized_policy=config.oversized_policy,
         packing_budgets=config.packing_budgets,
         cost_model=cost_model,
+        enable_balancing=True,
         validate=False,
-        objective=balancing_objective,
     )
     return LocalBalancingDataLoader(
         local_dataloader,
@@ -592,14 +525,13 @@ def build_local_balancing_dataloader(
         pack_fn=pack_fn,
         collate_fn=collate_fn,
         planner=planner,
-        transport=transport,
+        transport=DataPlaneTransport(groups, topology.global_rank),
         global_rank=topology.global_rank,
-        balancing_scope=balancing_scope,
         enable_balancing=True,
         bin_stats_fn=bin_stats_fn,
         device_prefetch=device_prefetch,
         max_steps=max_steps,
-        balance_stats_callback=balance_stats_callback,
+        balance_stats_callback=log_balance_stats,
     )
 
 

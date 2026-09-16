@@ -219,7 +219,7 @@ def _build_native_sampler_loader(
         dataset, mesh_context.device_mesh, config,
         batch_sampler=batch_sampler, metadata_fn=metadata_fn if metadata_fn is not None else _native_text_metadata,
         collate_fn=collate_fn, dataloader_kwargs=worker_kwargs,
-        communication_device=communication_device,
+        device=communication_device,
     )
 
 

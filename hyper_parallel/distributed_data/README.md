@@ -25,7 +25,7 @@ Model-parallel batch broadcast uses one small `broadcast_object_list` call for
 the Python structure and non-tensor values. Tensor leaves in dictionaries,
 lists, and tuples use `dist.broadcast` directly, avoiding pickle copies. CPU
 loads use the existing Gloo model group; when an accelerator
-`communication_device` is supplied, a matching HCCL/NCCL model tensor group is
+`device` is supplied, a matching HCCL/NCCL model tensor group is
 created and tensor leaves stay on device. Unsupported custom containers retain
 the regular object-broadcast behavior.
 
@@ -135,8 +135,6 @@ dataset:
     packing_stage: dataset
     load_balance: native_batch_sampler
     seq_length: 32768
-    distributed_dataloader:
-      double_buffer: true
 ```
 
 The Trainer builds its normal `build_dataset_batch_sampler` first, including
@@ -201,8 +199,6 @@ dataset:
   data_config:
     source_type: online
     load_balance: native_batch_sampler
-    distributed_dataloader:
-      double_buffer: true
   data_transform:
     _target_: hyper_parallel.auto_models.components.data.vlm.build_vlm_data_transform
     max_seq_len: 32768
@@ -291,28 +287,11 @@ tracks commit/checkpoint state, and applies packing/collation. The legacy
 `external_step_reader` remains supported as a compatibility interface. HP no
 longer infers step boundaries by scanning source metadata.
 
-With `double_buffer=True`, the first iterator call constructs its batch before
-returning. After each batch is returned, a background thread prepares exactly
-one subsequent distributed batch while the trainer consumes the current batch.
-The prefetch worker is created once and reused for subsequent steps.
-`_prepare_next_batch()` runs on that thread using the dedicated data control and
-payload process groups. `_broadcast_batch()` runs on the caller thread using the
-dedicated model-parallel batch group, then `_consume_batch()` handles the
-end-of-stream sentinel, commits Reader progress, and returns the training data.
-These operations do not
-issue collectives on the trainer's process groups. The default is `False`.
-
-With this option enabled, `metadata_fn`, `pack_fn`, and `collate_fn` run on the
-prefetch thread and may overlap model execution. They must not mutate shared
-trainer state. Accelerator allocations inside callbacks should use explicit
-devices instead of relying on a thread-local current device. Double buffering
-also retains the current trainer batch and one constructed next batch at once,
-so Host-memory usage increases accordingly.
-
-Checkpointing drains and discards speculative construction without committing
-its selected Reader samples, copies the completed-step state, and then restarts
-one-step prefetch. Restoring the checkpoint therefore reconstructs the same next
-step rather than treating a prefetched batch as consumed.
+The default path retains synchronous metadata-based planning and its checkpoint
+contract. Node-local cost balancing is a separate opt-in through
+`DistributedDatasetConfig(enable_dp_balance=True)`. It requires an external
+raw-step source and automatically enables Gloo exchange, one-step buffering and
+H2D. See [node-local balancing](NODE_LOCAL_BALANCING.md) for the compact API.
 
 Trainer-side H2D is a separate slot because CP-specific mask preparation and
 the accelerator copy stream are model-runtime concerns. `DeviceBatchPrefetcher`
@@ -333,7 +312,6 @@ for step in range(train_steps):
     loss = forward(batch)
     backward(loss)
     if step + 1 < train_steps:
-        # Host double buffering normally makes next(loader) immediately ready.
         device_prefetcher.prefetch(next(loader))
 ```
 
@@ -450,7 +428,7 @@ loader = build_distributed_dataloader(
     metadata_fn=metadata_for_sample,
     pack_fn=pack_one_sequence,
     collate_fn=collate_packed_sequences,
-    communication_device=torch.device("npu", local_rank),
+    device=torch.device("npu", local_rank),
 )
 ```
 
@@ -472,7 +450,7 @@ loader = build_distributed_dataloader(
     external_step_reader=reader,  # legacy compatibility API
     pack_fn=pack_one_sequence,
     collate_fn=collate_packed_sequences,
-    communication_device=torch.device("npu", local_rank),
+    device=torch.device("npu", local_rank),
 )
 ```
 
@@ -487,22 +465,21 @@ original packs; the legacy attribute name `reference_bins` is also accepted.
 
 The default packer and collator preserve the structure as a tuple of bins,
 each containing the raw samples. Custom callbacks must be consistent across
-ranks. Double buffering still overlaps planning, payload routing, and
-construction with training.
+ranks.
 
-Online payload A2A defaults to CPU/Gloo. A rank-local `communication_device`
+Online payload A2A defaults to CPU/Gloo. A rank-local `device`
 uses the WORLD accelerator backend by default (HCCL for NPU or NCCL for CUDA);
-`payload_backend` can override it. Python payloads still incur serialization
-and Host/device copies, so benchmark the target workload. Shared metadata mode
-bypasses payload transport entirely.
+Python payloads still incur serialization and Host/device copies. The enabled
+node-local path always exchanges raw samples with Gloo and uses the training
+device only for final H2D. Shared metadata mode bypasses payload transport entirely.
 
 ## Current boundaries
 
 - Native BatchSampler requires a mapping Dataset; metadata also requires shared indices.
 - Iterable/streaming online data requires an external complete-step source
   (or the compatibility Reader API).
-- At most one in-flight background batch when `double_buffer=True`; the first
-  batch and non-double-buffer mode wait synchronously.
+- Enabled node-local balancing retains at most one prefetched step, including
+  final H2D. The first step waits for preparation; the original path is synchronous.
 - Gloo control plane and correctness-first framed pickle payloads; online A2A
   may use Gloo, NCCL, or HCCL.
 - `drop_last=True`; every DP rank receives the same number of non-empty bins.
@@ -517,5 +494,6 @@ bypasses payload transport entirely.
 
 For automatic Host/H2D double buffering around an existing rank-local loader,
 v1 cost estimation, Gloo node-local LPT balancing and rank-zero DP logs, see
-[the reference configuration](NODE_LOCAL_BALANCING.md). This is a separate
-opt-in builder; the native pipeline and its checkpoint path above are unchanged.
+[the reference configuration](NODE_LOCAL_BALANCING.md). Set `enable_dp_balance`
+on the shared configuration and supply `model_config` to use the default cost.
+The original native pipeline and its checkpoint path remain the disabled path.
