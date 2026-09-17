@@ -23,6 +23,7 @@ from threading import Thread
 from typing import TYPE_CHECKING, Any
 
 from hyper_parallel.distributed_data.balance_logging import log_balance_stats
+from hyper_parallel.distributed_data.balancing_algorithm import BalancingAlgorithm, resolve_balancing_algorithm
 from hyper_parallel.distributed_data.cost_model import CostModel, resolve_cost_model
 from hyper_parallel.distributed_data.device_prefetch import DeviceStepPrefetcher, _create_device_prefetcher
 from hyper_parallel.distributed_data.locality import _create_locality_groups
@@ -34,7 +35,6 @@ from hyper_parallel.distributed_data.schema import (
     SampleKey,
     SampleMetadata,
 )
-from hyper_parallel.distributed_data.topology import DataTopology
 from hyper_parallel.distributed_data.transport import DataPlaneTransport
 
 if TYPE_CHECKING:
@@ -67,25 +67,22 @@ class _LocalBalancingIterator(Iterator[Any]):
             self.finished = True
             raise StopIteration
         try:
-            if self._loader.enable_balancing:
-                if self._thread is None:
-                    self._start_prefetch()
-                self.wait_for_prefetch()
-                self._thread = None
-                if self._error is not None:
-                    raise self._error
-                result = self._result
-                self._result = None
-                if result is None:
-                    raise RuntimeError("Local balancing prefetch completed without a batch.")
-            else:
-                result = self._collect_batch()
+            if self._thread is None:
+                self._start_prefetch()
+            self.wait_for_prefetch()
+            self._thread = None
+            if self._error is not None:
+                raise self._error
+            result = self._result
+            self._result = None
+            if result is None:
+                raise RuntimeError("Local balancing prefetch completed without a batch.")
         except BaseException:
             self.finished = True
             raise
         self._step += 1
         self._loader.last_balance_stats = result.stats
-        if self._loader.enable_balancing and not self._limit_reached():
+        if not self._limit_reached():
             self._start_prefetch()
         return self._loader._deliver_batch(result, self._step)
 
@@ -144,9 +141,8 @@ class LocalBalancingDataLoader:
             pack_fn: Callable[[Sequence[Any], int], Any],
             collate_fn: Callable[[Sequence[Any]], Any],
             planner: Any,
-            transport: DataPlaneTransport | None,
+            transport: DataPlaneTransport,
             global_rank: int,
-            enable_balancing: bool,
             bin_stats_fn: Callable[[Iterable[SampleMetadata]], dict[str, Any]] | None = None,
             device_prefetch: DeviceStepPrefetcher | None = None,
             max_steps: int | None = None,
@@ -157,8 +153,7 @@ class LocalBalancingDataLoader:
             raise ValueError("max_steps must be a positive integer or None.")
         self.local_dataloader = local_dataloader
         self.config = config
-        self.group_ranks = transport.ranks if transport is not None else (global_rank,)
-        self.enable_balancing = enable_balancing
+        self.group_ranks = transport.ranks
         self.max_steps = max_steps
         self.prefetches_to_device = device_prefetch is not None
         self.last_balance_stats: dict[str, Any] | None = None
@@ -269,12 +264,6 @@ class LocalBalancingDataLoader:
         return self._device_prefetch(batch) if self._device_prefetch is not None else batch
 
     def _construct_batch(self, raw_bins: Sequence[Sequence[Any]], step: int) -> _LocalBatch:
-        if not self.enable_balancing:
-            # Disabled mode intentionally does not call metadata_fn or cost_model,
-            # and creates no communication groups or sample payload codec buffers.
-            return _LocalBatch(self._collate_and_stage([
-                self._pack_fn(raw_bin, self.config.seq_len) for raw_bin in raw_bins
-            ]))
         metadata, local_payloads = self._read_step(raw_bins, step)
         gathered = self._transport.all_gather_object(metadata)
         plan, stats = self._plan_step(gathered, step)
@@ -400,7 +389,7 @@ class LocalBalancingDataLoader:
         return {
             "step": step,
             "scope": "node",
-            "objective": "makespan",
+            "objective": self._planner.objective,
             "group_ranks": self.group_ranks,
             "cost_before": tuple(before),
             "cost_after": tuple(after),
@@ -411,6 +400,7 @@ class LocalBalancingDataLoader:
             "moved_samples": moved,
             "send_samples": tuple(send_samples),
             "recv_samples": tuple(recv_samples),
+            **self._planner.last_balance_decision,
         }
 
 
@@ -424,6 +414,7 @@ def build_local_balancing_dataloader(
         collate_fn: Callable[[Sequence[Any]], Any] = list,
         model_config: Any = None,
         cost_model: CostModel | None = None,
+        balancing_algorithm: BalancingAlgorithm | None = None,
         device: Any = None,
         move_fn: Callable[[Any, Any], Any] | None = None,
         bin_stats_fn: Callable[[Iterable[SampleMetadata]], dict[str, Any]] | None = None,
@@ -435,13 +426,15 @@ def build_local_balancing_dataloader(
         local_dataloader: Each yield contains exactly local_batch_size non-empty
             raw-sample bins. The source owns sampling and worker prefetch.
         mesh: WORLD-covering named mesh with model-parallel dimensions of size one.
-        config: Packing limits and the enable_dp_balance opt-in switch.
+        config: Packing limits and the minimum relative improvement required.
         metadata_fn: CPU-only per-sample metadata and cost features.
         pack_fn: Construct one packed sequence from its assigned raw samples.
         collate_fn: Assemble the local step as a sequence of microbatches.
         model_config: Effective backbone dimensions for the default FLOPs model.
-            Required when balancing is enabled and cost_model is omitted.
+            Required when cost_model is omitted.
         cost_model: Optional user estimate replacing the default cost model.
+        balancing_algorithm: Optional sample assignment and objective policy.
+            Costs and the improvement gate remain framework-owned.
         device: Training device; defaults to the current NPU or CUDA device.
             CPU-only execution keeps batches on the host.
         move_fn: Optional per-microbatch tensor mapping to the training device;
@@ -450,36 +443,22 @@ def build_local_balancing_dataloader(
         max_steps: Stop before prefetching beyond the requested training steps.
 
     Returns:
-        A local-step loader. Enabled balancing always uses node-local Gloo,
-        cost-first LPT, automatic one-step buffering and final H2D prefetch.
-        Disabled balancing preserves source packs without metadata or exchanges.
+        A local-step loader using node-local Gloo, automatic one-step buffering
+        and final H2D prefetch. Each step retains its source packs unless the
+        candidate improves its objective by more than min_balance_gain.
 
     Note:
         All ranks must consume the same number of steps. Checkpoint/resume and
-        nontrivial model parallelism are not supported by this opt-in path.
+        nontrivial model parallelism are not supported by this local-step path.
         The iterator yields CPU views for metering; take_device_microbatch()
         hands the staged device view to training without another transfer.
     """
-    if not config.enable_dp_balance:
-        topology = DataTopology.from_mesh(mesh, dp_dim_names=config.dp_dim_names)
-        return LocalBalancingDataLoader(
-            local_dataloader,
-            config=config,
-            metadata_fn=metadata_fn,
-            pack_fn=pack_fn,
-            collate_fn=collate_fn,
-            planner=None,
-            transport=None,
-            global_rank=topology.global_rank,
-            enable_balancing=False,
-            max_steps=max_steps,
-        )
-
     error = None
     identity = None
     device_prefetch = None
     try:
         cost_model = resolve_cost_model(cost_model, model_config)
+        balancing_algorithm = resolve_balancing_algorithm(balancing_algorithm)
         device_prefetch = _create_device_prefetcher(device, move_fn)
         if not all(callable(callback) for callback in (metadata_fn, pack_fn, collate_fn)):
             raise ValueError("metadata_fn, pack_fn and collate_fn must be callable.")
@@ -490,7 +469,18 @@ def build_local_balancing_dataloader(
         PackingConstraints(config.seq_len, config.oversized_policy, config.packing_budgets)
         identity = json.dumps({
             "config": asdict(config),
-            "cost_model": getattr(cost_model, "model_id", type(cost_model).__qualname__),
+            "policies": {
+                name: {
+                    "implementation": (
+                        f"{policy.__module__}.{getattr(policy, '__qualname__', type(policy).__qualname__)}"
+                    ),
+                    "version": getattr(policy, field_name, None),
+                }
+                for name, policy, field_name in (
+                    ("cost_model", cost_model, "model_id"),
+                    ("balancing_algorithm", balancing_algorithm, "algorithm_id"),
+                )
+            },
             "max_steps": max_steps,
             "device_type": None if device_prefetch is None else device_prefetch.device.type,
         }, sort_keys=True)
@@ -509,7 +499,8 @@ def build_local_balancing_dataloader(
         oversized_policy=config.oversized_policy,
         packing_budgets=config.packing_budgets,
         cost_model=cost_model,
-        enable_balancing=True,
+        balancing_algorithm=balancing_algorithm,
+        min_balance_gain=config.min_balance_gain,
         validate=False,
     )
     return LocalBalancingDataLoader(
@@ -521,7 +512,6 @@ def build_local_balancing_dataloader(
         planner=planner,
         transport=DataPlaneTransport(groups, topology.global_rank),
         global_rank=topology.global_rank,
-        enable_balancing=True,
         bin_stats_fn=bin_stats_fn,
         device_prefetch=device_prefetch,
         max_steps=max_steps,

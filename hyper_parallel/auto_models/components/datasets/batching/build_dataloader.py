@@ -30,6 +30,8 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from hyper_parallel.auto_models.components.datasets.dataset_logging import get_dataset_logger
 from hyper_parallel.auto_models.components.datasets.parallel import build_dataset_batch_sampler
 from hyper_parallel.distributed_data import (
+    BalancingAlgorithm,
+    CostModel,
     DistributedDatasetConfig,
     SampleMetadata,
     build_distributed_dataloader,
@@ -172,7 +174,18 @@ def _normalize_source_samples(source_item: Any) -> list[Mapping[str, Any]]:
 
 def _native_text_metadata(sample: Mapping[str, Any]) -> SampleMetadata:
     """Describe a complete GPT output without inferring new attention boundaries."""
-    return SampleMetadata(pack_tokens=int(sample["tokens"].shape[-1]))
+    seq_len = int(sample["tokens"].shape[-1])
+    return SampleMetadata(pack_tokens=seq_len, features={"P": seq_len, "D": 0})
+
+
+def _configured_policy(dataloader_target: Any, name: str, supplied: Any, model_config: Any) -> Any:
+    """Prefer an explicit policy, otherwise instantiate its configured target."""
+    if supplied is not None:
+        return supplied
+    configured = getattr(dataloader_target, name, None)
+    if configured is None:
+        return None
+    return configured.build(model_config=model_config)
 
 
 def _build_native_sampler_loader(
@@ -186,6 +199,9 @@ def _build_native_sampler_loader(
         *,
         metadata_fn: Callable[[Any], SampleMetadata] | None = None,
         max_seq_len: int | None = None,
+        model_config: Any = None,
+        cost_model: CostModel | None = None,
+        balancing_algorithm: BalancingAlgorithm | None = None,
 ) -> Any:
     """Reuse native Dataset outputs and the existing collator in collective loading."""
     if batch_sampler is None:
@@ -220,6 +236,11 @@ def _build_native_sampler_loader(
         batch_sampler=batch_sampler, metadata_fn=metadata_fn if metadata_fn is not None else _native_text_metadata,
         collate_fn=collate_fn, dataloader_kwargs=worker_kwargs,
         device=communication_device,
+        model_config=model_config,
+        cost_model=_configured_policy(dataloader_target, "cost_model", cost_model, model_config),
+        balancing_algorithm=_configured_policy(
+            dataloader_target, "balancing_algorithm", balancing_algorithm, model_config,
+        ),
     )
 
 
@@ -298,6 +319,9 @@ def build_dataloader(
         max_seq_len: int | None = None,
         default_seed: int = 1234,
         metadata_fn: Callable[[Any], SampleMetadata] | None = None,
+        model_config: Any = None,
+        cost_model: CostModel | None = None,
+        balancing_algorithm: BalancingAlgorithm | None = None,
 ) -> tuple[tuple[Any | None, ...], tuple[Any | None, ...]]:
     """Build train, validation, and test DataLoaders.
 
@@ -314,8 +338,12 @@ def build_dataloader(
         data_config: Dataset options, including the Indexed packing stage.
         max_seq_len: Maximum sample length used to derive dynamic token budget.
         default_seed: Seed used when no training seed is configured.
-        metadata_fn: Native sample cost callback for ``load_balance=native_batch_sampler``.
-            Defaults to complete GPT output lengths; VLMTrainer supplies its image-patch estimator.
+        metadata_fn: Native physical sample metadata for ``load_balance=native_batch_sampler``.
+            Defaults to complete GPT output lengths; VLMTrainer supplies image metadata.
+        model_config: Effective model dimensions for the default workload estimator.
+            Unsupported architectures require an explicit cost model.
+        cost_model: Optional workload callback overriding the configured cost-model target.
+        balancing_algorithm: Optional assignment policy overriding its configured target.
 
     Returns:
         DataLoader and batch-sampler tuples for the three Dataset splits.
@@ -381,6 +409,7 @@ def build_dataloader(
             dataloader = _build_native_sampler_loader(
                 dataset, batch_sampler, collate_fn, dataloader_target, mesh_context, data_config, seed,
                 metadata_fn=metadata_fn, max_seq_len=max_seq_len,
+                model_config=model_config, cost_model=cost_model, balancing_algorithm=balancing_algorithm,
             )
         else:
             dataloader = dataloader_target.build(

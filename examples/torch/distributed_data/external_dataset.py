@@ -74,7 +74,7 @@ def main() -> None:
         } for length in lengths]]
         for step in range(3)
     ]
-    config = DistributedDatasetConfig(seq_len=300, local_batch_size=1, enable_dp_balance=True)
+    config = DistributedDatasetConfig(seq_len=300, local_batch_size=1, min_balance_gain=0.0)
     dataset = build_distributed_dataset(
         source, metadata="metadata", collate_fn=collate_tokens,
         cpu_fields=("offsets",), log_fields=("P", "D"),

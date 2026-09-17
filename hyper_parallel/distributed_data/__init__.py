@@ -16,6 +16,7 @@
 
 from hyper_parallel.distributed_data.api import DistributedDatasetConfig, build_distributed_dataloader
 from hyper_parallel.distributed_data.balance_logging import format_balance_stats, log_balance_stats
+from hyper_parallel.distributed_data.balancing_algorithm import BalancingAlgorithm, LPTBalancingAlgorithm
 from hyper_parallel.distributed_data.cost_model import BackboneFlopsConfig, CostModel, DefaultCostModel
 from hyper_parallel.distributed_data.data_constructor import default_collate_fn, default_pack_fn
 from hyper_parallel.distributed_data.dataset import DistributedDataset, build_distributed_dataset
@@ -37,6 +38,8 @@ from hyper_parallel.distributed_data.schema import (
 
 __all__ = [
     "BackboneFlopsConfig",
+    "BalancingAlgorithm",
+    "LPTBalancingAlgorithm",
     "BufferedSampleMetadata",
     "CostModel",
     "DefaultCostModel",

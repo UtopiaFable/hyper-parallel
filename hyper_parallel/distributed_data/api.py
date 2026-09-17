@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -40,6 +41,7 @@ from hyper_parallel.distributed_data.dataset import DistributedDataset
 from hyper_parallel.distributed_data.dataset_dataloader import DatasetDataLoader
 from hyper_parallel.distributed_data.device_prefetch import _resolve_device
 from hyper_parallel.distributed_data.distributed_dataloader import DistributedDataLoader
+from hyper_parallel.distributed_data.balancing_algorithm import BalancingAlgorithm
 from hyper_parallel.distributed_data.cost_model import CostModel
 from hyper_parallel.distributed_data.packed_balancing import LocalBalancingDataLoader, build_local_balancing_dataloader
 from hyper_parallel.distributed_data.external_step import ExternalStepAdapter, ExternalStepSource
@@ -116,12 +118,11 @@ class DistributedDatasetConfig:
         pin_memory: Whether sample loader workers pin returned sample memory.
         prefetch_factor: Samples prefetched by each worker.
         persistent_workers: Whether workers persist for the loader lifetime.
-        enable_dp_balance: Opt into node-local cost balancing for dataset-owned or external raw
-            steps, including Gloo exchange, automatic double buffering and H2D.
-            False retains the original metadata-based packing path, or preserves
-            source bins when using the dataset facade.
-        packing_budgets: Optional per-packed-sequence additive hard limits for
-            ``build_local_balancing_dataloader``. Each configured stage must
+        min_balance_gain: Minimum relative improvement in the algorithm's
+            objective. A candidate is accepted only when its gain is strictly
+            greater; zero rejects equal or worse placements.
+        packing_budgets: Optional per-packed-sequence additive hard limits.
+            Each configured stage must
             occur in every sample's packing_costs. These limits are independent
             of cost-model balancing scores.
     """
@@ -141,7 +142,6 @@ class DistributedDatasetConfig:
     pin_memory: bool = False
     prefetch_factor: int | None = None
     persistent_workers: bool = False
-    enable_dp_balance: bool = False
     min_balance_gain: float = 0.0
     packing_budgets: dict[str, float] | None = None
 
@@ -182,7 +182,6 @@ class DistributedDatasetConfig:
                 "dataset_already_sharded",
                 "drop_last",
                 "shuffle",
-                "enable_dp_balance",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be boolean.")
@@ -423,6 +422,9 @@ class _BuildState:
     """Rank-local components and partial validation results needed across build stages."""
 
     metadata_mode: bool
+    model_config: Any = None
+    cost_model: CostModel | None = None
+    balancing_algorithm: BalancingAlgorithm | None = None
     topology: DataTopology | None = None
     dataset_reader_ranks: tuple[int, ...] | None = None
     planner_rank: int | None = None
@@ -681,7 +683,11 @@ def _finalize_build_state(
         seq_len=config.seq_len,
         local_batch_size=config.local_batch_size,
         oversized_policy=config.oversized_policy,
+        packing_budgets=config.packing_budgets,
         min_balance_gain=config.min_balance_gain,
+        model_config=state.model_config,
+        cost_model=state.cost_model,
+        balancing_algorithm=state.balancing_algorithm,
     )
     state.constructor = PackingDataConstructor(effective_pack_fn, effective_collate_fn, seq_len=config.seq_len)
     state.config_fingerprint = _config_fingerprint(
@@ -696,6 +702,19 @@ def _finalize_build_state(
     )
     if batch_sampler_fingerprint is not None:
         state.config_fingerprint += ":batch_sampler:" + batch_sampler_fingerprint
+    state.config_fingerprint += ":policies:" + _policy_fingerprint(state.planner)
+
+
+def _policy_fingerprint(planner: DynamicPackingPlanner) -> str:
+    """Include policy versions in native build agreement and checkpoint identity."""
+    identities = []
+    for policy, field_name in ((planner.cost_model, "model_id"), (planner.balancing_algorithm, "algorithm_id")):
+        policy_type = policy if hasattr(policy, "__qualname__") else type(policy)
+        identities.append({
+            "implementation": f"{policy_type.__module__}.{policy_type.__qualname__}",
+            "version": getattr(policy, field_name, None),
+        })
+    return hashlib.sha256(json.dumps(identities, sort_keys=True).encode()).hexdigest()
 
 
 def _populate_build_state(
@@ -819,6 +838,7 @@ def build_distributed_dataloader(
         external_step_source: ExternalStepSource | None = None,
         model_config: Any = None,
         cost_model: CostModel | None = None,
+        balancing_algorithm: BalancingAlgorithm | None = None,
         move_fn: Callable[[Any, Any], Any] | None = None,
         bin_stats_fn: Callable[[Iterable[SampleMetadata]], dict[str, Any]] | None = None,
         max_steps: int | None = None,
@@ -863,7 +883,7 @@ def build_distributed_dataloader(
             default preserves each planned bin as a raw-sample tuple.
         collate_fn: Optionally collate ``local_batch_size`` packed sequences.
             The default preserves the bins as a tuple.
-        device: Rank-local training device. Enabled node-local balancing uses
+        device: Rank-local training device. Node-local balancing uses
             it only for final H2D; metadata and raw samples always use Gloo.
             The original path retains its device payload transport.
         batch_sampler: Optional native HP BatchSampler. Supply the rank-local
@@ -884,16 +904,19 @@ def build_distributed_dataloader(
             ranks.
         external_step_source: Preferred source-only API for online mode. It must
             be an iterable whose next value is one complete local step, represented
-            as ``local_batch_size`` raw-sample bins, and implement checkpoint and
-            epoch methods. HP supplies metadata, payload caching, commit, packing,
-            collation, and distributed placement through ``metadata_fn``,
-            ``pack_fn``, and ``collate_fn``.
-        model_config: Effective backbone dimensions. With enable_dp_balance,
-            the default cost model is constructed from this configuration.
+            as ``local_batch_size`` raw-sample bins on every pure-DP rank.
+            HP supplies metadata, payload caching, packing, collation and
+            distributed placement through ``metadata_fn``, ``pack_fn`` and
+            ``collate_fn``. Optional ``set_epoch`` is forwarded to the source;
+            this buffered route does not provide checkpoint/resume.
+        model_config: Effective backbone dimensions required when cost_model
+            is omitted. The default cost model is constructed from these dimensions.
         cost_model: Optional user workload callback replacing the default.
-        move_fn: Enabled-path H2D field mapping; retain CPU-only metadata here.
-        bin_stats_fn: Optional per-bin counters in the enabled rank-zero log.
-        max_steps: Enabled-path step limit, including speculative prefetch.
+        balancing_algorithm: Optional assignment and objective policy. Receives
+            already-scored samples; Hyper enforces capacities and the gain gate.
+        move_fn: Local-step H2D field mapping; retain CPU-only metadata here.
+        bin_stats_fn: Optional per-bin counters in the local-step rank-zero log.
+        max_steps: Local-step step limit, including speculative prefetch.
 
     Returns:
         Collective iterator yielding constructed local batches.
@@ -903,9 +926,12 @@ def build_distributed_dataloader(
         epoch; arbitrary worker-side RNG state is not captured. Metadata and
         Dataset lengths must agree across all Data Constructor ranks. Metadata
         entries must describe deterministic, rank-independent Dataset outputs.
-        enable_dp_balance is opt-in and requires a DistributedDataset or external_step_source
-        and pure DP. That path uses fixed node-local Gloo, LPT and buffered H2D;
-        checkpoint/resume remains available only on the original path.
+        A DistributedDataset or external_step_source uses pure DP, node-local
+        Gloo and buffered H2D. Every step evaluates a candidate; sample exchange
+        occurs only when its objective improves by more than min_balance_gain.
+        Checkpoint/resume remains available only on the reader/sampler path.
+        Stateful custom policies should expose configuration-versioned model_id
+        or algorithm_id attributes for build/checkpoint identity.
     """
     if isinstance(dataset, DistributedDataset):
         if any(value is not None for value in (
@@ -921,16 +947,16 @@ def build_distributed_dataloader(
             collate_fn=list,
             model_config=model_config,
             cost_model=cost_model,
+            balancing_algorithm=balancing_algorithm,
             device=device,
             move_fn=dataset.move_to_device,
             bin_stats_fn=dataset.summarize if dataset.log_fields else None,
             max_steps=max_steps,
         )
         return DatasetDataLoader(dataset, loader, device)
-    if isinstance(config, DistributedDatasetConfig) and config.enable_dp_balance:
-        if external_step_source is None or batch_sampler is not None or metadata is not None \
-                or external_step_reader is not None:
-            raise ValueError("enable_dp_balance requires external_step_source without a sampler or legacy reader.")
+    if external_step_source is not None:
+        if batch_sampler is not None or metadata is not None or external_step_reader is not None:
+            raise ValueError("external_step_source cannot be combined with a sampler, metadata sequence or reader.")
         if dataloader_kwargs:
             raise ValueError("Configure source worker options on external_step_source, not the balancing wrapper.")
         return build_local_balancing_dataloader(
@@ -942,6 +968,7 @@ def build_distributed_dataloader(
             collate_fn=default_collate_fn if collate_fn is None else collate_fn,
             model_config=model_config,
             cost_model=cost_model,
+            balancing_algorithm=balancing_algorithm,
             device=device,
             move_fn=move_fn,
             bin_stats_fn=bin_stats_fn,
@@ -960,6 +987,9 @@ def build_distributed_dataloader(
         batch_sampler=batch_sampler,
         external_step_reader=external_step_reader,
         external_step_source=external_step_source,
+        model_config=model_config,
+        cost_model=cost_model,
+        balancing_algorithm=balancing_algorithm,
     )
 
 
@@ -977,11 +1007,17 @@ def _build_distributed_dataloader_impl(
         batch_sampler: Any = None,
         external_step_reader: Any | None = None,
         external_step_source: ExternalStepSource | None = None,
+        model_config: Any = None,
+        cost_model: CostModel | None = None,
+        balancing_algorithm: BalancingAlgorithm | None = None,
 ) -> DistributedDataLoader:
     if external_step_reader is not None and external_step_source is not None:
         raise ValueError("external_step_reader and external_step_source are mutually exclusive.")
     metadata_mode = _resolve_metadata_mode(metadata_fn, metadata, external_step_reader, external_step_source)
-    state = _BuildState(metadata_mode=metadata_mode)
+    state = _BuildState(
+        metadata_mode=metadata_mode, model_config=model_config,
+        cost_model=cost_model, balancing_algorithm=balancing_algorithm,
+    )
     try:
         _populate_build_state(
             state,

@@ -50,7 +50,7 @@ class DatasetDataLoader(Iterator[list[Any]]):
         self.last_host_batch = host_batch
         if self._loader.prefetches_to_device:
             return [self._loader.take_device_microbatch(index) for index in range(len(host_batch))]
-        # Disabled balancing has no producer: transfer on the consumer stream.
+        # CPU-only execution has no device-prefetch slot.
         return [self.dataset.move_to_device(batch, self.device) for batch in host_batch]
 
     def __len__(self) -> int:

@@ -38,7 +38,7 @@ from hyper_parallel.distributed_data import (
 
 
 class TokenDataset:
-    """Small mapping Dataset with variable sample lengths and costs."""
+    """Small mapping Dataset with variable sample lengths."""
 
     def __init__(self) -> None:
         """Build enough samples for two distributed batches."""
@@ -47,7 +47,6 @@ class TokenDataset:
             {
                 "sample_id": index,
                 "input_ids": torch.full((length,), index, dtype=torch.int64),
-                "vision_cost": float((index % 4) + 1),
             }
             for index, length in enumerate(lengths)
         ]
@@ -70,14 +69,13 @@ class _Mesh:
 
 
 def metadata_fn(sample: dict[str, Any]) -> SampleMetadata:
-    """Describe packing length and a synthetic multimodal encoder cost.
+    """Describe packing length without coupling metadata to a cost formula.
 
     Args:
         sample: A complete variable-length source sample.
     """
     return SampleMetadata(
         pack_tokens=int(sample["input_ids"].numel()),
-        cost=WorkloadCost(encoder=sample["vision_cost"]),
         sample_id=sample["sample_id"],
     )
 
@@ -119,10 +117,11 @@ def main() -> None:
         metadata=metadata,
         batch_sampler=batch_sampler,
         collate_fn=collate_fn,
+        cost_model=lambda sample: WorkloadCost(llm=float(sample.pack_tokens)),
     )
     for step, batch in enumerate(loader):
         print(
-            f"rank={rank} step={step} plan={loader.last_plan.plan_id} "
+            f"rank={rank} step={step} plan={loader.last_plan_id} "
             f"sample_ids={batch['sample_ids']} valid_tokens={batch['valid_tokens']}",
             flush=True,
         )

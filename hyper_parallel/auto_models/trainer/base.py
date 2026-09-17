@@ -87,6 +87,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..components.datasets.llm.chat_template import ChatTemplate
+    from hyper_parallel.distributed_data import BalancingAlgorithm, CostModel
     from hyper_parallel.distributed_data.schema import SampleMetadata
 
 
@@ -452,7 +453,13 @@ class BaseTrainer(Stateful, ABC):
         """Require a concrete Trainer to build its micro-batch collator."""
         raise NotImplementedError("Concrete Trainer must implement _build_collate_fn")
 
-    def _build_dataloader(self, *, metadata_fn: Callable[[Any], SampleMetadata] | None = None) -> None:
+    def _build_dataloader(
+            self,
+            *,
+            metadata_fn: Callable[[Any], SampleMetadata] | None = None,
+            cost_model: CostModel | None = None,
+            balancing_algorithm: BalancingAlgorithm | None = None,
+    ) -> None:
         """Build and assign train, validation, and test dataloaders."""
         split_names = ("train", "valid", "test")
         datasets = tuple(getattr(self, f"{split_name}_dataset", None) for split_name in split_names)
@@ -466,6 +473,9 @@ class BaseTrainer(Stateful, ABC):
             max_seq_len=getattr(self.data_transform, "max_seq_len", None),
             default_seed=self.default_seed,
             metadata_fn=metadata_fn,
+            model_config=self.model_config,
+            cost_model=cost_model,
+            balancing_algorithm=balancing_algorithm,
         )
         for split_name, dataloader, batch_sampler in zip(split_names, dataloaders, batch_samplers):
             setattr(self, f"{split_name}_dataloader", dataloader)

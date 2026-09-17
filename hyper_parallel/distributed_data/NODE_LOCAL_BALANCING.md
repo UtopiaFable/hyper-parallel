@@ -1,11 +1,12 @@
 # Node-local balancing
 
-`enable_dp_balance=True` selects one fixed pipeline: default backbone FLOPs,
-capacity-constrained LPT, node-local Gloo exchange, automatic one-step buffering,
-and final H2D on a copy stream. No separate backend, buffer, or planner options
-are needed. The default is false. Existing native loading is unchanged; the
-dataset facade described below preserves source bins and uses ordinary
-consumer-stream device transfer when balancing is disabled.
+Dataset-owned or external raw-step loading uses default backbone FLOPs,
+capacity-constrained LPT, node-local Gloo, automatic one-step buffering and
+final H2D on a copy stream. There is no enable switch: every step evaluates a
+candidate, but raw samples move only when the candidate's relative objective
+improvement is strictly greater than `min_balance_gain` (default `0.0`).
+Equal, worse or insufficient-gain candidates retain the original distribution.
+Metadata gathering and planning still occur when sample exchange is skipped.
 
 ## Dataset-based integration
 
@@ -24,7 +25,7 @@ config = DistributedDatasetConfig(
     seq_len=seq_len,
     local_batch_size=microbatches_per_step,
     packing_budgets=packing_budgets,
-    enable_dp_balance=True,
+    min_balance_gain=0.0,
 )
 dataset = build_distributed_dataset(
     source,
@@ -77,16 +78,70 @@ with build_distributed_dataloader(
 - Default-model features are per-sample `P`, `D`, and conditional-image token
   runs for blockwise attention. `P + D == pack_tokens`. Packing budgets remain
   hard limits separate from predicted FLOPs.
-- Accept a candidate only if its `(maximum cost, variance, range)` improves.
-  Failed packing or an unchanged score retains the original sample layout.
+- The default objective is maximum predicted rank workload. Accept a candidate
+  only when `(original_score - candidate_score) / original_score` is strictly
+  greater than `min_balance_gain`; a zero original score keeps the original.
+  `0.05`, for example, requires more than a 5% reduction. Failed LPT packing
+  returns the reference layout. Equal maximum load is not a makespan improvement.
 - Only global rank zero logs its node's before/after packs, transfers and cost.
+  Per-bin `cost` and rank `cost_before`/`cost_after`, maxima and spread retain the
+  `WorkloadCost.llm` component for compatibility (`cost_component=llm`). Decision
+  fields `original`, `candidate` and `relative_gain` use the algorithm's actual
+  objective, which may depend on different components and need not be additive.
 - H2D selects the current NPU/CUDA device automatically; `device` can specify it.
   CPU-only execution keeps host batches. Use compute-stream synchronization,
   not device-wide synchronization, to avoid draining the next step's copy.
-- This opt-in requires pure DP, equal step counts and a raw-step source.
+- This local-step route requires pure DP, equal step counts and a raw-step source.
   It does not support loader checkpoint/resume or native shared-metadata reads.
-  The dataset facade does not add checkpoint/resume, including when balancing
-  is disabled. Use the original native entry for checkpointable loading.
+  The dataset facade does not add checkpoint/resume. Use the reader/sampler
+  entry for checkpointable loading; it uses the same cost/algorithm contracts.
+
+## Independent cost and assignment policies
+
+Both policies are optional builder arguments. Omitting `cost_model` constructs
+`DefaultCostModel(model_config)`; omitting `balancing_algorithm` constructs
+`LPTBalancingAlgorithm()`. Neither callback needs communication or H2D code.
+
+```python
+from hyper_parallel.distributed_data import LPTBalancingAlgorithm
+
+loader = build_distributed_dataloader(
+    dataset, mesh, config, device=device,
+    cost_model=my_cost_model,
+    balancing_algorithm=LPTBalancingAlgorithm(objective="makespan"),
+)
+```
+
+A user algorithm implements the `BalancingAlgorithm` protocol:
+
+```python
+class MyBalancingAlgorithm:
+    algorithm_id = "my-placement-v1"
+    objective_name = "makespan"
+
+    def assign(self, samples, *, reference_bins, constraints,
+               data_parallel_size, local_batch_size):
+        # samples contain metadata.cost already computed by the cost model.
+        # Return DP-major bins of SampleKey values, not payloads or new costs.
+        return my_placement(samples, reference_bins, constraints,
+                            data_parallel_size, local_batch_size)
+
+    def objective(self, rank_costs):
+        # A finite, nonnegative scalar; smaller is better.
+        return max(cost.llm for cost in rank_costs)
+```
+
+The result must have `data_parallel_size * local_batch_size` nonempty bins,
+contain every input occurrence exactly once, and respect token/stage budgets.
+Hyper reconstructs actual rank costs from the scored samples, applies the same
+objective to original and candidate layouts, and owns the threshold gate. A
+custom algorithm cannot replace costs or force an inferior placement through.
+The default LPT assignment and its objective live in `balancing_algorithm.py`;
+`planner.py` handles cost evaluation, plan construction and acceptance.
+
+For checkpointable reader/sampler loading, stateful cost/algorithm objects
+should provide configuration-versioned `model_id` / `algorithm_id` attributes.
+Those identities participate in cross-rank build and checkpoint fingerprints.
 
 ## Existing integrations
 
@@ -94,7 +149,9 @@ The original `external_step_source`, `metadata_fn`, `pack_fn`, `move_fn` and
 `bin_stats_fn` arguments remain supported for existing users. That entry still
 yields CPU views and uses `take_device_microbatch()` for staged device inputs.
 Do not mix those arguments with a `DistributedDataset`: the dataset owns all
-data callbacks. Plain Dataset + native BatchSampler loading is unchanged.
+data callbacks. Plain Dataset + native BatchSampler retains its selection and
+checkpoint mechanism, but now receives the same cost and algorithm parameters.
+It also requires `model_config` when no custom cost model is supplied.
 
 A runnable CPU example is
 `examples/torch/distributed_data/external_dataset.py`.

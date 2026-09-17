@@ -64,6 +64,12 @@ def format_balance_stats(stats: dict[str, Any], step: int, max_steps: int | None
     """
     iteration = str(step) if max_steps is None else f"{step}/{max_steps}"
     lines = [f"[dp-balance] iteration {iteration} :"]
+    if "relative_gain" in stats:
+        lines.append(
+            f"  cost_component=llm, objective={stats['objective']}, original={stats['original_objective']:.12g}, "
+            f"candidate={stats['candidate_objective']:.12g}, relative_gain={stats['relative_gain']:.12g}, "
+            f"min_balance_gain={stats['min_balance_gain']:.12g}, accepted={stats['accepted']}"
+        )
     ranks = stats["group_ranks"]
     before, after = stats.get("bins_before"), stats.get("bins_after")
     if before is not None:

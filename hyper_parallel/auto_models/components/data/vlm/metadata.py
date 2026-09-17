@@ -58,4 +58,8 @@ def vlm_sample_metadata(sample: Mapping[str, Any]) -> SampleMetadata:
     if pixels is None or pixels.ndim != 2 or pixels.shape[0] != image_patches:
         raise ValueError("VLM pixel_values rows must equal the raw patch count from image_grid_thw")
     seq_len = int(input_ids.shape[0])
-    return SampleMetadata(pack_tokens=seq_len, cost=WorkloadCost(encoder=float(image_patches), llm=float(seq_len)))
+    return SampleMetadata(
+        pack_tokens=seq_len,
+        features={"P": seq_len, "D": 0, "image_patches": image_patches},
+        cost=WorkloadCost(encoder=float(image_patches), llm=float(seq_len)),
+    )

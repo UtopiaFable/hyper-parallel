@@ -14,9 +14,10 @@ native BatchSampler selects this step's Dataset-index occurrences
 
 external_step_source emits a complete local step of raw-sample bins
   -> HP derives metadata and freezes the source step -> Planner
-  -> payload A2A when redistributed -> pack_fn -> collate_fn
+  -> node-local payload A2A when redistributed -> pack_fn -> collate_fn
+  -> buffered H2D -> Trainer (pure DP, no loader checkpoint)
 
-both paths
+native BatchSampler / legacy external_step_reader
   -> broadcast the local batch to model-parallel peers (schema object + direct tensor leaves)
   -> commit consumed progress -> Trainer
 ```
@@ -62,8 +63,8 @@ should contain; there is no refill/`attempt` loop.
 - `buffer_size_multiplier` remains accepted for compatibility but does not affect
   these paths. External readers prepare one complete local step; native
   BatchSampler always emits its complete batch. An external source emits one
-  complete local step; HP owns metadata extraction, payload caching, commit,
-  checkpointing, and final packing/collation.
+  complete local step; HP owns metadata extraction, payload caching, and final
+  packing/collation. Checkpointing is supported only by the reader/sampler path.
 
 The Planner consumes the step's metadata and original grouping directly:
 `planner.plan(samples, reference_bins=reference_bins, step=step)`.
@@ -79,12 +80,14 @@ and the final sample-conservation audit (when `validate=True`) remain unchanged.
 
 External applications can bind their source, metadata, collator and CPU field
 policy with `build_distributed_dataset`, then pass that object and a
-`DistributedDatasetConfig` to `build_distributed_dataloader`. With
-`enable_dp_balance=True`, this path automatically performs node-local Gloo
-balancing, double buffering and H2D, and yields ready device microbatches.
+`DistributedDatasetConfig` to `build_distributed_dataloader`. This path
+automatically evaluates node-local balancing, double buffers and stages H2D,
+and yields ready device microbatches. Sample exchange occurs only when the
+algorithm's objective improves by more than `min_balance_gain`.
 See [dataset-based integration](NODE_LOCAL_BALANCING.md) for the complete
-contract. Existing callback-based and native BatchSampler entries remain
-available without changes.
+contract. `cost_model` and `balancing_algorithm` are independently replaceable.
+Native BatchSampler loading retains its selection/checkpoint mechanisms and
+uses these same policy arguments; default costs require `model_config`.
 
 ```python
 from hyper_parallel.distributed_data import (
@@ -122,6 +125,7 @@ loader = build_distributed_dataloader(
     batch_sampler=batch_sampler,
     metadata_fn=lambda sample: SampleMetadata(pack_tokens=len(sample["tokens"])),
     collate_fn=native_collate_fn,
+    cost_model=my_cost_model,
 )
 ```
 
@@ -161,10 +165,28 @@ The Trainer builds its normal `build_dataset_batch_sampler` first, including
 `single`/`cyclic`, `data_sharding`, and the supported index rearrangement map.
 It passes that sampler to the collective loader instead of applying another
 Reader stride. Worker settings and the original `dataloader.collate_fn` are
-retained. The initial text adapter supplies token lengths, not a calibrated TND
-cost model; fixed-length GPT outputs therefore do not automatically gain compute
-balance from this opt-in. The lower-level API accepts user-provided costs through
-`metadata_fn` or `metadata`.
+retained. The text adapter supplies physical token lengths as `P`, with `D=0`;
+it does not extract internal TND boundaries. Fixed-length GPT outputs therefore
+do not automatically gain compute balance from this route. The Trainer supplies
+its effective model configuration to the default FLOPs model. Architectures
+outside that model's latent-attention scope require an explicit `cost_model`;
+metadata's old proxy `cost` is not a fallback.
+The Python builder accepts `cost_model` and `balancing_algorithm` directly.
+AutoModels YAML can instead declare optional factories under `dataloader`:
+
+```yaml
+dataloader:
+  cost_model:
+    _target_: my_training.cost.SampleCost  # user-provided factory
+  balancing_algorithm:
+    _target_: hyper_parallel.distributed_data.LPTBalancingAlgorithm
+    objective: makespan
+```
+
+These factories are constructed only for `load_balance: native_batch_sampler`;
+they may accept the runtime `model_config`. Explicit Python policy arguments
+take precedence over configured factories. Omitting both selects default costs
+and LPT, not a separate disabled planner.
 For CUDA/NPU meshes the Trainer passes the foreground rank-local device to the
 existing device payload transport; CPU meshes use Gloo.
 
@@ -257,12 +279,14 @@ native HP BatchSampler selects each round's Dataset-index occurrences
   indivisible sample**. Input IDs, prompt-masked labels, attention masks,
   modality markers, pixels and grids move together. No label shifting, new
   padding policy, or cross-conversation packing is introduced.
-- The default `hyper_parallel.auto_models.components.data.vlm.metadata.vlm_sample_metadata` estimator
-  uses `sum(T * H * W)` over the processor's actual `image_grid_thw` as encoder
-  workload, and padded text width as LLM workload and `pack_tokens`. Raw vision
-  patches are not the same as merged LLM image placeholders. This is a simple
-  workload proxy, **not a calibrated cost model**. Custom estimates can be
-  supplied via `metadata_fn` when calling `build_distributed_dataloader` directly.
+- `hyper_parallel.auto_models.components.data.vlm.metadata.vlm_sample_metadata`
+  describes padded width as `pack_tokens`/`P`, sets `D=0`, and exposes
+  `image_patches=sum(T * H * W)` from the processor's actual `image_grid_thw`.
+  Raw patches are not merged LLM image placeholders. Legacy proxy costs remain
+  in the metadata for compatibility; the planner uses only the resolved cost
+  model's estimates. Supply custom estimates through `cost_model`, separately
+  from the metadata callback. The YAML above must be paired with a compatible
+  default-model configuration or a user cost-model factory as shown earlier.
 - The Trainer integration uses **online metadata**, extracted after the native
   Dataset transform. It cannot balance CPU image decoding/processing already
   performed by the Readers. Native `_TransformDataset` still performs its
@@ -303,17 +327,17 @@ The lower-level Indexed source Dataset and text packing helpers remain available
 for custom producers. To retain dynamic packing across raw source samples, that
 producer must define complete steps and provide an `external_step_source`.
 The source only iterates raw local steps; HP derives metadata, caches payloads,
-tracks commit/checkpoint state, and applies packing/collation. The legacy
+and applies packing/collation. The legacy
 `external_step_reader` remains supported as a compatibility interface. HP no
 longer infers step boundaries by scanning source metadata.
 
-The default path retains synchronous metadata-based planning and its checkpoint
-contract. Node-local cost balancing is a separate opt-in through
-`DistributedDatasetConfig(enable_dp_balance=True)`. It requires an external
-raw-step source and automatically enables Gloo exchange, one-step buffering and
-H2D. See [node-local balancing](NODE_LOCAL_BALANCING.md) for the compact API.
+Reader/sampler loading retains synchronous planning and its checkpoint
+contract. Dataset-owned and external raw-step loading automatically uses
+node-local Gloo, one-step buffering and H2D. Every path accepts independent
+cost and assignment policies; plans below the required relative improvement
+keep the original distribution. See [node-local balancing](NODE_LOCAL_BALANCING.md).
 
-Trainer-side H2D is a separate slot because CP-specific mask preparation and
+For the reader/sampler path, Trainer-side H2D is a separate slot because CP-specific mask preparation and
 the accelerator copy stream are model-runtime concerns. `DeviceBatchPrefetcher`
 implements the reusable stream/Event part:
 
@@ -363,6 +387,7 @@ loader = build_distributed_dataloader(
     config,
     batch_sampler=batch_sampler,
     metadata_fn=metadata_fn,
+    cost_model=my_cost_model,
     dataloader_kwargs={
         "num_workers": 8,
         "pin_memory": True,
@@ -406,6 +431,7 @@ loader = build_distributed_dataloader(
     batch_sampler=batch_sampler,
     metadata=precomputed_metadata,
     collate_fn=native_collate_fn,
+    cost_model=my_cost_model,
 )
 ```
 
@@ -424,37 +450,37 @@ order, then let the native BatchSampler own DP slicing and shuffling.
 ### External online steps
 
 The preferred API separates the external producer from HP's distributed data
-semantics. The source only iterates complete local steps and implements the
-checkpoint/epoch hooks:
+semantics. The source only iterates complete local steps; an optional epoch
+hook resets source selection:
 
 ```python
 class MyStepSource:
     def __iter__(self): ...  # yields local_batch_size raw-sample bins
-    def state_dict(self): ...
-    def load_state_dict(self, state): ...
     def set_epoch(self, epoch): ...
 ```
 
 Pass it as `external_step_source`. HP calls `metadata_fn` for each raw sample,
-keeps payloads until the step commits, performs distributed placement, and
-then invokes `pack_fn` and `collate_fn` on the final Constructor batch:
+keeps payloads while preparing the step, performs distributed placement, and
+then invokes `pack_fn` and `collate_fn` on the final local batch:
 
 ```python
 loader = build_distributed_dataloader(
     None,
     mesh,
     config,
-    external_step_source=source,  # only Dataset Reader ranks supply an instance
+    external_step_source=source,  # every rank supplies its own pure-DP raw steps
     metadata_fn=metadata_for_sample,
     pack_fn=pack_one_sequence,
     collate_fn=collate_packed_sequences,
     device=torch.device("npu", local_rank),
+    cost_model=my_cost_model,
 )
 ```
 
 The source must yield exactly `local_batch_size` non-empty raw-sample bins per
-step. HP owns metadata, payload, commit, checkpoint, and placement state. The
-source must not implement those HP concerns.
+step. This node-local route automatically buffers preparation/H2D and applies
+the shared gain gate. It does not provide checkpoint/resume. HP owns metadata,
+payload and placement state; source epoch handling stays in the source.
 
 For existing integrations, the compatibility API below accepts a legacy
 `external_step_reader` that already exposes HP's reader lifecycle methods.
@@ -471,6 +497,7 @@ loader = build_distributed_dataloader(
     pack_fn=pack_one_sequence,
     collate_fn=collate_packed_sequences,
     device=torch.device("npu", local_rank),
+    cost_model=my_cost_model,
 )
 ```
 
@@ -498,12 +525,12 @@ device only for final H2D. Shared metadata mode bypasses payload transport entir
 - Native BatchSampler requires a mapping Dataset; metadata also requires shared indices.
 - Iterable/streaming online data requires an external complete-step source
   (or the compatibility Reader API).
-- Enabled node-local balancing retains at most one prefetched step, including
+- Node-local balancing retains at most one prefetched step, including
   final H2D. The first step waits for preparation; the original path is synchronous.
 - Gloo control plane and pickle payloads; online A2A
   may use Gloo, NCCL, or HCCL.
 - `drop_last=True`; every DP rank receives the same number of non-empty bins.
-- Checkpoints are per rank and include transformed read-ahead payloads. Sample
+- Reader/sampler checkpoints are per rank and include transformed read-ahead payloads. Sample
   keys and plans replay exactly when the Dataset stream is deterministic for a
   given epoch; arbitrary Dataset/worker RNG state is not captured.
   Every training rank must save and restore its own loader state.
@@ -514,6 +541,7 @@ device only for final H2D. Shared metadata mode bypasses payload transport entir
 
 For automatic Host/H2D double buffering around an existing rank-local loader,
 v1 cost estimation, Gloo node-local LPT balancing and rank-zero DP logs, see
-[the reference configuration](NODE_LOCAL_BALANCING.md). Set `enable_dp_balance`
-on the shared configuration and supply `model_config` to use the default cost.
-The original native pipeline and its checkpoint path remain the disabled path.
+[the reference configuration](NODE_LOCAL_BALANCING.md). Supply `model_config`
+to use the default cost, or provide `cost_model`. A custom
+`balancing_algorithm` owns assignment and its scalar objective; Hyper applies
+the shared `min_balance_gain` acceptance threshold before sample exchange.
