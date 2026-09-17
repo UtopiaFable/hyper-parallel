@@ -33,7 +33,6 @@ from hyper_parallel.distributed_data.schema import (
     PackingConstraints,
     SampleKey,
     SampleMetadata,
-    StepSampleSelection,
 )
 from hyper_parallel.distributed_data.topology import DataTopology
 from hyper_parallel.distributed_data.transport import DataPlaneTransport
@@ -324,21 +323,16 @@ class LocalBalancingDataLoader:
             key_bins.append(tuple(keys))
         return (tuple(key_bins), tuple(entries)), payloads
 
-    @staticmethod
-    def _selection(gathered: Sequence[Any]) -> StepSampleSelection:
-        samples = []
-        reference_bins = []
-        for bins, entries in gathered:
-            reference_bins.extend(bins)
-            for key, metadata in entries:
-                samples.append(BufferedSampleMetadata(key, metadata, len(samples)))
-        return StepSampleSelection(tuple(samples), tuple(reference_bins), validate=False)
-
     def _plan_step(self, gathered: Sequence[Any], step: int) -> tuple[DistributedPackingPlan, dict[str, Any]]:
         result = None
         if self._global_rank == self._transport.planner_rank:
-            selection = self._selection(gathered)
-            plan = self._planner.plan(selection, step=step)
+            samples = []
+            reference_bins = []
+            for bins, entries in gathered:
+                reference_bins.extend(bins)
+                for key, metadata in entries:
+                    samples.append(BufferedSampleMetadata(key, metadata, len(samples)))
+            plan = self._planner.plan(samples, reference_bins=reference_bins, step=step)
             stats = self._statistics(plan, step)
             if self._global_rank == 0:
                 stats.update(self._bin_statistics(gathered, plan))

@@ -152,10 +152,10 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
         ):
             plan = loader._build_plan_control(snapshots)
 
-        selection = plan_step.call_args.args[0]
-        self.assertEqual(tuple(item.key for item in selection.samples), (first.key, second.key))
-        self.assertEqual(tuple(item.global_sample_position for item in selection.samples), (0, 1))
-        self.assertEqual(selection.reference_bins, ((first.key,), (second.key,)))
+        samples = plan_step.call_args.args[0]
+        self.assertEqual(tuple(item.key for item in samples), (first.key, second.key))
+        self.assertEqual(tuple(item.global_sample_position for item in samples), (0, 1))
+        self.assertEqual(plan_step.call_args.kwargs["reference_bins"], ((first.key,), (second.key,)))
         self.assertEqual(set(plan.selected_keys), {first.key, second.key})
 
     def test_readers_must_exhaust_at_the_same_step(self) -> None:

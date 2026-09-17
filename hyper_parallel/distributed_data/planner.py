@@ -32,7 +32,6 @@ from hyper_parallel.distributed_data.schema import (
     PackingBinPlan,
     PackingConstraints,
     SampleKey,
-    StepSampleSelection,
     WorkloadCost,
 )
 
@@ -132,41 +131,46 @@ class DynamicPackingPlanner:
 
     def plan(
             self,
-            selection: StepSampleSelection,
+            samples: Sequence[BufferedSampleMetadata],
             *,
+            reference_bins: Sequence[Sequence[SampleKey]],
             step: int,
     ) -> DistributedPackingPlan:
         """Balance every selected sample exactly once.
 
         Args:
-            selection: Frozen current-step membership plus a known-feasible
-                canonical reference packing.
+            samples: Exactly the sample occurrences selected for this step.
+                Metadata input order does not affect placement.
+            reference_bins: Known-feasible original grouping of those occurrences,
+                ordered by data rank and then local bin index. Used for cost
+                comparison and fallback; every sample key must occur once.
             step: Zero-based distributed-yield index.
 
         Returns:
             Full plan containing exactly the selected sample keys.
         """
-        selection = self._estimate_selection(selection)
-        ordered = self._validate_plan_request(selection, step)
+        self._validate_plan_request(samples, reference_bins, step)
+        samples = self._estimate_samples(samples)
+        ordered = self._validate_and_order(samples)
         bins = [
             _MutableBin(data_rank=data_rank, pack_index=pack_index)
             for data_rank in range(self.data_parallel_size)
             for pack_index in range(self.local_batch_size)
         ]
         rank_costs = [WorkloadCost() for _ in range(self.data_parallel_size)]
-        bins, rank_costs = self._place_samples(selection, ordered, bins, rank_costs)
+        bins, rank_costs = self._place_samples(ordered, reference_bins, bins, rank_costs)
         if self.enable_balancing:
-            reference_bins, reference_costs = self._reference_bins_in_order(selection)
+            original_bins, reference_costs = self._reference_bins_in_order(samples, reference_bins)
             scale = max((cost.llm for cost in (*reference_costs, *rank_costs)), default=0.0)
             if self._objective_score(rank_costs, scale) >= self._objective_score(reference_costs, scale):
-                bins, rank_costs = reference_bins, reference_costs
+                bins, rank_costs = original_bins, reference_costs
         elif self.min_balance_gain:
-            reference_bins, reference_costs = self._reference_bins_in_order(selection)
+            original_bins, reference_costs = self._reference_bins_in_order(samples, reference_bins)
             if self._reference_is_better(reference_costs, rank_costs):
-                bins, rank_costs = reference_bins, reference_costs
+                bins, rank_costs = original_bins, reference_costs
         local_batches = self._freeze_bins(bins)
         if self._validate:
-            self._validate_conservation(local_batches, selection)
+            self._validate_conservation(local_batches, samples)
         plan_id = self._plan_id(step, local_batches)
         return DistributedPackingPlan(
             plan_id=plan_id,
@@ -178,16 +182,16 @@ class DynamicPackingPlanner:
             validate=False,
         )
 
-    def _estimate_selection(self, selection: StepSampleSelection) -> StepSampleSelection:
+    def _estimate_samples(
+            self, samples: Sequence[BufferedSampleMetadata],
+    ) -> Sequence[BufferedSampleMetadata]:
         """Attach balancing estimates without mutating the reader's metadata."""
         self.last_sample_costs = {}
-        if self._validate and not isinstance(selection, StepSampleSelection):
-            raise ValueError(f"selection must be StepSampleSelection, but got {type(selection)}.")
         if self.cost_model is None:
-            self.last_sample_costs = {item.key: item.metadata.cost for item in selection.samples}
-            return selection
+            self.last_sample_costs = {item.key: item.metadata.cost for item in samples}
+            return samples
         estimated_samples = []
-        for item in selection.samples:
+        for item in samples:
             cost = self.cost_model(item.metadata)
             if self._validate and not isinstance(cost, WorkloadCost):
                 raise ValueError(f"cost_model must return WorkloadCost for sample {item.key}, but got {type(cost)}.")
@@ -199,19 +203,19 @@ class DynamicPackingPlanner:
             object.__setattr__(estimated_item, "metadata", metadata)
             estimated_samples.append(estimated_item)
             self.last_sample_costs[item.key] = cost
-        estimated_selection = copy(selection)
-        object.__setattr__(estimated_selection, "samples", tuple(estimated_samples))
-        return estimated_selection
+        return tuple(estimated_samples)
 
     def _reference_bins_in_order(
-            self, selection: StepSampleSelection,
+            self,
+            samples: Sequence[BufferedSampleMetadata],
+            reference_bins: Sequence[Sequence[SampleKey]],
     ) -> tuple[list[_MutableBin], list[WorkloadCost]]:
         """Materialize the canonical bins in their original rank order."""
-        samples_by_key = {item.key: item for item in selection.samples}
+        samples_by_key = {item.key: item for item in samples}
         bins: list[_MutableBin] = []
         rank_costs = [WorkloadCost() for _ in range(self.data_parallel_size)]
         rank_tokens = [0] * self.data_parallel_size
-        for index, key_bin in enumerate(selection.reference_bins):
+        for index, key_bin in enumerate(reference_bins):
             data_rank = index // self.local_batch_size
             packing_bin = _MutableBin(data_rank=data_rank, pack_index=index % self.local_batch_size)
             for key in key_bin:
@@ -231,27 +235,37 @@ class DynamicPackingPlanner:
 
     def _validate_plan_request(
             self,
-            selection: StepSampleSelection,
+            samples: Sequence[BufferedSampleMetadata],
+            reference_bins: Sequence[Sequence[SampleKey]],
             step: int,
-    ) -> tuple[BufferedSampleMetadata, ...]:
+    ) -> None:
+        if not samples:
+            raise ValueError("Step samples must not be empty.")
         if self._validate and (not isinstance(step, int) or isinstance(step, bool) or step < 0):
             raise ValueError(f"step must be a non-negative integer, but got {step!r}.")
-        if len(selection.reference_bins) != self.distributed_bin_count:
+        if len(reference_bins) != self.distributed_bin_count:
             raise ValueError(
                 f"Step selection expected {self.distributed_bin_count} reference bins, "
-                f"but got {len(selection.reference_bins)}."
+                f"but got {len(reference_bins)}."
             )
-        ordered = self._validate_and_order(selection.samples)
-        if len(ordered) < self.distributed_bin_count:
+        if len(samples) < self.distributed_bin_count:
             raise ValueError(
-                f"Step selection has {len(ordered)} samples for {self.distributed_bin_count} non-empty bins."
+                f"Step selection has {len(samples)} samples for {self.distributed_bin_count} non-empty bins."
             )
-        return ordered
+        if self._validate:
+            if any(not packing_bin for packing_bin in reference_bins):
+                raise ValueError("reference_bins must contain non-empty bins.")
+            sample_keys = {item.key for item in samples}
+            if len(sample_keys) != len(samples):
+                raise ValueError("Step samples must have unique SampleKey values.")
+            reference_keys = tuple(key for packing_bin in reference_bins for key in packing_bin)
+            if len(reference_keys) != len(samples) or set(reference_keys) != sample_keys:
+                raise ValueError("Reference bins must contain every selected sample exactly once.")
 
     def _place_samples(
             self,
-            selection: StepSampleSelection,
             ordered: Sequence[BufferedSampleMetadata],
+            reference_bins: Sequence[Sequence[SampleKey]],
             bins: list[_MutableBin],
             rank_costs: list[WorkloadCost],
     ) -> tuple[list[_MutableBin], list[WorkloadCost]]:
@@ -271,9 +285,9 @@ class DynamicPackingPlanner:
             feasible = [packing_bin for packing_bin in bins if self._fits(packing_bin, item)]
             if not feasible:
                 if self.enable_balancing:
-                    bins, rank_costs = self._reference_bins_in_order(selection)
+                    bins, rank_costs = self._reference_bins_in_order(ordered, reference_bins)
                 else:
-                    bins, rank_costs = self._place_reference_bins(selection)
+                    bins, rank_costs = self._place_reference_bins(ordered, reference_bins)
                 break
             selected = min(
                 feasible,
@@ -286,22 +300,23 @@ class DynamicPackingPlanner:
 
     def _place_reference_bins(
             self,
-            selection: StepSampleSelection,
+            samples: Sequence[BufferedSampleMetadata],
+            reference_bins: Sequence[Sequence[SampleKey]],
     ) -> tuple[list[_MutableBin], list[WorkloadCost]]:
         """Balance known-feasible reference packs when sample-level packing fails."""
-        samples_by_key = {item.key: item for item in selection.samples}
-        reference_bins = []
-        for original_index, key_bin in enumerate(selection.reference_bins):
+        samples_by_key = {item.key: item for item in samples}
+        scored_bins = []
+        for original_index, key_bin in enumerate(reference_bins):
             items = tuple(samples_by_key[key] for key in key_bin)
             cost = sum((item.metadata.cost for item in items), WorkloadCost())
             tokens = sum(item.metadata.pack_tokens for item in items)
-            reference_bins.append((original_index, items, cost, tokens))
-        reference_bins.sort(key=lambda item: (-item[2].dominant, -item[2].total, -item[3], item[0]))
+            scored_bins.append((original_index, items, cost, tokens))
+        scored_bins.sort(key=lambda item: (-item[2].dominant, -item[2].total, -item[3], item[0]))
 
         rank_costs = [WorkloadCost() for _ in range(self.data_parallel_size)]
         rank_tokens = [0 for _ in range(self.data_parallel_size)]
         rank_bins: list[list[_MutableBin]] = [[] for _ in range(self.data_parallel_size)]
-        for _, items, cost, tokens in reference_bins:
+        for _, items, cost, tokens in scored_bins:
             eligible_ranks = [
                 data_rank
                 for data_rank in range(self.data_parallel_size)
@@ -325,10 +340,10 @@ class DynamicPackingPlanner:
     @staticmethod
     def _validate_conservation(
             local_batches: Sequence[Sequence[PackingBinPlan]],
-            selection: StepSampleSelection,
+            samples: Sequence[BufferedSampleMetadata],
     ) -> None:
         """Reject any balanced plan that drops or duplicates a selected key."""
-        selected_keys = tuple(item.key for item in selection.samples)
+        selected_keys = tuple(item.key for item in samples)
         planned_keys = tuple(
             key
             for local_batch in local_batches

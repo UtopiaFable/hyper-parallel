@@ -32,7 +32,6 @@ from hyper_parallel.distributed_data.schema import (
     BufferedSampleMetadata,
     DistributedPackingPlan,
     SampleKey,
-    StepSampleSelection,
 )
 from hyper_parallel.distributed_data.metadata import PlannedSampleLoader
 from hyper_parallel.distributed_data.topology import DataTopology
@@ -599,13 +598,11 @@ class DistributedDataLoader(Iterator[Any]):
             snapshot for snapshot in snapshots if snapshot.rank in self._dataset_reader_ranks
         ]
         if self._batch_sampler_mode:
-            selection = self._select_native_batch(reader_snapshots)
-        else:
-            selection = self._select_external_step(reader_snapshots)
-        return None if selection is None else self._planner.plan(selection, step=self._step)
+            return self._plan_native_batch(reader_snapshots)
+        return self._plan_external_step(reader_snapshots)
 
-    def _select_external_step(self, snapshots: list[_ReaderSnapshot]) -> StepSampleSelection | None:
-        """Freeze the exact sample set emitted by an external legacy producer.
+    def _plan_external_step(self, snapshots: list[_ReaderSnapshot]) -> DistributedPackingPlan | None:
+        """Plan the exact sample set emitted by an external legacy producer.
 
         Each Dataset Reader has already run its local sample selector for the
         current step.  We preserve that union and let the HP planner only
@@ -634,16 +631,17 @@ class DistributedDataLoader(Iterator[Any]):
             BufferedSampleMetadata(item.key, item.metadata, position)
             for position, item in enumerate(samples)
         )
-        return StepSampleSelection(
-            samples=external_samples,
+        return self._planner.plan(
+            external_samples,
             reference_bins=tuple(
                 tuple(item.key for item in packing_bin)
                 for packing_bin in original_metadatas
             ),
+            step=self._step,
         )
 
-    def _select_native_batch(self, snapshots: list[_ReaderSnapshot]) -> StepSampleSelection | None:
-        """Freeze this forward/backward round exactly as native DP samplers selected it."""
+    def _plan_native_batch(self, snapshots: list[_ReaderSnapshot]) -> DistributedPackingPlan | None:
+        """Plan this forward/backward round exactly as native DP samplers selected it."""
         if all(snapshot.exhausted for snapshot in snapshots):
             return None
         if any(snapshot.exhausted for snapshot in snapshots):
@@ -654,7 +652,9 @@ class DistributedDataLoader(Iterator[Any]):
             (item for snapshot in snapshots for item in snapshot.metadata),
             key=lambda item: item.global_sample_position,
         ))
-        return StepSampleSelection(samples=samples, reference_bins=tuple((item.key,) for item in samples))
+        return self._planner.plan(
+            samples, reference_bins=tuple((item.key,) for item in samples), step=self._step,
+        )
 
     def _prepare_outgoing(
             self,

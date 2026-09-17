@@ -23,7 +23,6 @@ from hyper_parallel.distributed_data.schema import (
     BufferedSampleMetadata,
     SampleKey,
     SampleMetadata,
-    StepSampleSelection,
     WorkloadCost,
 )
 from tests.common.mark_utils import arg_mark
@@ -46,19 +45,122 @@ def _candidate(
     )
 
 
-def _selection(candidates, bin_sizes) -> StepSampleSelection:
-    """Represent a step and reference bins already selected by its producer."""
+def _reference_bins(candidates, bin_sizes) -> tuple[tuple[SampleKey, ...], ...]:
+    """Return the original grouping already selected by the producer."""
     ordered = tuple(sorted(candidates, key=lambda item: item.global_sample_position))
     bins = []
     offset = 0
     for size in bin_sizes:
         bins.append(tuple(item.key for item in ordered[offset:offset + size]))
         offset += size
-    return StepSampleSelection(samples=ordered, reference_bins=tuple(bins))
+    return tuple(bins)
 
 
 class TestDynamicPackingPlanner(unittest.TestCase):
     """Verify exact-set sample balancing, fallback, overflow, and stability."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_direct_inputs_reject_invalid_step_membership(self) -> None:
+        """Feature: Direct Planner input validation.
+        Description: Supply empty, duplicated, missing, or unexpected sample occurrences.
+        Expectation: Invalid membership is rejected before cost estimation or placement.
+        """
+        samples = (_candidate(0, 2), _candidate(1, 2))
+        first, second = (sample.key for sample in samples)
+        reference_bins = ((first,), (second,))
+        cases = (
+            ((), reference_bins, 0, "samples must not be empty"),
+            (samples, reference_bins, -1, "step must be"),
+            (samples, ((first, second),), 0, "expected 2 reference bins"),
+            (samples[:1], reference_bins, 0, "1 samples for 2"),
+            (samples, ((), (first, second)), 0, "non-empty bins"),
+            ((samples[0], samples[0]), ((first,), (first,)), 0, "unique SampleKey"),
+            (samples, ((first,), (first,)), 0, "every selected sample exactly once"),
+            (samples, ((first,), (SampleKey(0, 99),)), 0, "every selected sample exactly once"),
+            (samples, ((first, second), (second,)), 0, "every selected sample exactly once"),
+        )
+        planner = DynamicPackingPlanner(data_parallel_size=2, seq_len=8, local_batch_size=1)
+        with patch.object(planner, "_estimate_samples") as estimate:
+            for candidates, bins, step, message in cases:
+                with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                    planner.plan(candidates, reference_bins=bins, step=step)
+            estimate.assert_not_called()
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_repeated_dataset_indices_remain_distinct_occurrences(self) -> None:
+        """Feature: Sample occurrence identity.
+        Description: Plan two occurrences of the same Dataset index.
+        Expectation: Both SampleKey values survive as independently selected samples.
+        """
+        samples = tuple(
+            BufferedSampleMetadata(SampleKey(0, 7, position), SampleMetadata(2), position)
+            for position in range(2)
+        )
+        planner = DynamicPackingPlanner(data_parallel_size=2, seq_len=8, local_batch_size=1)
+        plan = planner.plan(samples, reference_bins=_reference_bins(samples, (1, 1)), step=0)
+        self.assertEqual(set(plan.selected_keys), {sample.key for sample in samples})
+        self.assertEqual(len(plan.selected_keys), 2)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_cost_estimation_preserves_input_metadata_and_fallback(self) -> None:
+        """Feature: Cost estimation without a selection wrapper.
+        Description: Estimate costs on a step whose greedy packing reaches a dead end.
+        Expectation: Reference grouping survives and Reader-owned metadata is unchanged.
+        """
+        samples = tuple(
+            _candidate(index, tokens, cost=WorkloadCost(encoder=index + 1))
+            for index, tokens in enumerate((6, 2, 2, 5, 3, 2))
+        )
+        reference_bins = _reference_bins(samples, (3, 3))
+        for enabled in (False, True):
+            with self.subTest(enable_balancing=enabled):
+                planner = DynamicPackingPlanner(
+                    data_parallel_size=1, seq_len=10, local_batch_size=2,
+                    enable_balancing=enabled, cost_model=lambda _metadata: WorkloadCost(llm=1),
+                )
+                plan = planner.plan(samples, reference_bins=reference_bins, step=0)
+                self.assertEqual(
+                    tuple(packing_bin.sample_keys for packing_bin in plan.local_batches[0]), reference_bins,
+                )
+                self.assertEqual(plan.rank_costs, (WorkloadCost(llm=6),))
+                self.assertEqual(planner.last_sample_costs, {sample.key: WorkloadCost(llm=1) for sample in samples})
+                self.assertEqual(
+                    [sample.metadata.cost for sample in samples],
+                    [WorkloadCost(encoder=index + 1) for index in range(len(samples))],
+                )
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_minimum_gain_uses_original_rank_grouping(self) -> None:
+        """Feature: Native minimum balancing gain.
+        Description: Require more improvement than the balanced placement provides.
+        Expectation: Original bins and their costs are retained in rank order.
+        """
+        samples = tuple(
+            _candidate(index, 5, cost=WorkloadCost(llm=cost), reader_rank=index // 2)
+            for index, cost in enumerate((9, 9, 1, 1))
+        )
+        reference_bins = _reference_bins(samples, (2, 2))
+        planner = DynamicPackingPlanner(
+            data_parallel_size=2, seq_len=10, local_batch_size=1, min_balance_gain=0.6,
+        )
+        plan = planner.plan(samples, reference_bins=reference_bins, step=0)
+        self.assertEqual(tuple(batch[0].sample_keys for batch in plan.local_batches), reference_bins)
+        self.assertEqual([cost.llm for cost in plan.rank_costs], [18, 2])
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_capacity_checks_remain_active_for_trusted_inputs(self) -> None:
+        """Feature: Mandatory packing capacity.
+        Description: Supply two individually valid samples that overflow their only bin.
+        Expectation: Capacity enforcement remains active with metadata auditing disabled.
+        """
+        samples = (_candidate(0, 3), _candidate(1, 3))
+        for validate in (False, True):
+            with self.subTest(validate=validate):
+                planner = DynamicPackingPlanner(
+                    data_parallel_size=1, seq_len=5, local_batch_size=1, validate=validate,
+                )
+                with self.assertRaisesRegex(ValueError, "cannot fit within this bin"):
+                    planner.plan(samples, reference_bins=_reference_bins(samples, (2,)), step=0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_enabled_cost_first_balancing_keeps_nonimproving_reference(self) -> None:
@@ -76,14 +178,14 @@ class TestDynamicPackingPlanner(unittest.TestCase):
                     _candidate(index, 5, cost=WorkloadCost(llm=cost), reader_rank=index // 2)
                     for index, cost in enumerate(costs)
                 )
-                selection = _selection(samples, (2, 2))
-                plan = planner.plan(selection, step=0)
+                reference_bins = _reference_bins(samples, (2, 2))
+                plan = planner.plan(samples, reference_bins=reference_bins, step=0)
                 self.assertEqual([cost.llm for cost in plan.rank_costs], expected_costs)
                 self.assertEqual(set(plan.selected_keys), {sample.key for sample in samples})
                 self.assertEqual(planner.last_sample_costs, {sample.key: sample.metadata.cost for sample in samples})
                 if costs[0] == 1:
                     self.assertEqual(
-                        tuple(batch[0].sample_keys for batch in plan.local_batches), selection.reference_bins,
+                        tuple(batch[0].sample_keys for batch in plan.local_batches), reference_bins,
                     )
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
@@ -94,9 +196,9 @@ class TestDynamicPackingPlanner(unittest.TestCase):
         """
         planner = DynamicPackingPlanner(data_parallel_size=2, seq_len=10, local_batch_size=1)
         candidates = tuple(_candidate(index, tokens) for index, tokens in enumerate((7, 3, 7, 3)))
-        selection = _selection(candidates, (2, 2))
+        reference_bins = _reference_bins(candidates, (2, 2))
 
-        plan = planner.plan(selection, step=0)
+        plan = planner.plan(candidates, reference_bins=reference_bins, step=0)
 
         self.assertEqual(set(plan.selected_keys), {candidate.key for candidate in candidates})
         for local_batch in plan.local_batches:
@@ -120,10 +222,9 @@ class TestDynamicPackingPlanner(unittest.TestCase):
             for index in range(4)
         )
 
-        first_selection = _selection(first_costs, (2, 2))
-        second_selection = _selection(second_costs, (2, 2))
-        first_plan = planner.plan(first_selection, step=0)
-        second_plan = planner.plan(second_selection, step=0)
+        reference_bins = _reference_bins(first_costs, (2, 2))
+        first_plan = planner.plan(first_costs, reference_bins=reference_bins, step=0)
+        second_plan = planner.plan(second_costs, reference_bins=reference_bins, step=0)
 
         self.assertEqual(set(first_plan.selected_keys), set(second_plan.selected_keys))
         self.assertNotEqual(first_plan.local_sample_keys(0), second_plan.local_sample_keys(0))
@@ -136,9 +237,9 @@ class TestDynamicPackingPlanner(unittest.TestCase):
         """
         planner = DynamicPackingPlanner(data_parallel_size=1, seq_len=10, local_batch_size=2)
         candidates = tuple(_candidate(index, tokens) for index, tokens in enumerate((6, 2, 2, 5, 3, 2)))
-        selection = _selection(candidates, (3, 3))
+        reference_bins = _reference_bins(candidates, (3, 3))
 
-        plan = planner.plan(selection, step=3)
+        plan = planner.plan(candidates, reference_bins=reference_bins, step=3)
 
         self.assertEqual(set(plan.selected_keys), {candidate.key for candidate in candidates})
         self.assertEqual([packing_bin.pack_tokens for packing_bin in plan.local_batches[0]], [10, 10])
@@ -156,13 +257,13 @@ class TestDynamicPackingPlanner(unittest.TestCase):
         """
         planner = DynamicPackingPlanner(data_parallel_size=1, seq_len=10, local_batch_size=1)
         candidates = (_candidate(0, 5), _candidate(1, 5))
-        selection = _selection(candidates, (2,))
+        reference_bins = _reference_bins(candidates, (2,))
 
         with (
                 patch.object(planner, "_freeze_bins", return_value=()),
                 self.assertRaisesRegex(ValueError, "conserve the frozen step sample set exactly"),
         ):
-            planner.plan(selection, step=0)
+            planner.plan(candidates, reference_bins=reference_bins, step=0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_candidate_gather_order_does_not_change_the_plan(self) -> None:
@@ -183,10 +284,9 @@ class TestDynamicPackingPlanner(unittest.TestCase):
             )
         )
 
-        forward_selection = _selection(candidates, (2, 2, 2, 2))
-        reverse_selection = _selection(tuple(reversed(candidates)), (2, 2, 2, 2))
-        forward = planner.plan(forward_selection, step=9)
-        reversed_plan = planner.plan(reverse_selection, step=9)
+        reference_bins = _reference_bins(candidates, (2, 2, 2, 2))
+        forward = planner.plan(candidates, reference_bins=reference_bins, step=9)
+        reversed_plan = planner.plan(tuple(reversed(candidates)), reference_bins=reference_bins, step=9)
 
         self.assertEqual(forward, reversed_plan)
         self.assertEqual(forward.plan_id, reversed_plan.plan_id)
@@ -198,9 +298,9 @@ class TestDynamicPackingPlanner(unittest.TestCase):
         Expectation: The default policy rejects overflow during planning.
         """
         planner = DynamicPackingPlanner(data_parallel_size=1, seq_len=10, local_batch_size=1)
-        selection = _selection((_candidate(0, 12),), (1,))
+        samples = (_candidate(0, 12),)
         with self.assertRaisesRegex(ValueError, "requires 12 tokens, exceeding seq_len=10"):
-            planner.plan(selection, step=0)
+            planner.plan(samples, reference_bins=_reference_bins(samples, (1,)), step=0)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_single_policy_places_oversized_sample_alone(self) -> None:
@@ -214,9 +314,9 @@ class TestDynamicPackingPlanner(unittest.TestCase):
             local_batch_size=1,
             oversized_policy="single",
         )
-        selection = _selection((_candidate(0, 12),), (1,))
+        samples = (_candidate(0, 12),)
 
-        plan = planner.plan(selection, step=0)
+        plan = planner.plan(samples, reference_bins=_reference_bins(samples, (1,)), step=0)
 
         packing_bin = plan.local_batches[0][0]
         self.assertTrue(packing_bin.oversized)

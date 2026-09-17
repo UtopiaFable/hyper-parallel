@@ -65,6 +65,13 @@ should contain; there is no refill/`attempt` loop.
   complete local step; HP owns metadata extraction, payload caching, commit,
   checkpointing, and final packing/collation.
 
+The Planner consumes the step's metadata and original grouping directly:
+`planner.plan(samples, reference_bins=reference_bins, step=step)`.
+`samples` contains `BufferedSampleMetadata` entries; `reference_bins` contains
+their `SampleKey` values grouped in original data-rank/bin order. This does not
+select or read additional samples. Original bins remain available for cost
+comparison and fallback.
+
 ## Public API
 
 External applications can bind their source, metadata, collator and CPU field

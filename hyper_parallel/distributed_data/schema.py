@@ -302,47 +302,6 @@ class PackingConstraints:
 
 
 @dataclass(frozen=True)
-class StepSampleSelection:
-    """Frozen sample membership and a known-feasible reference packing.
-
-    ``samples`` contains exactly the samples admitted to one distributed step.
-    ``reference_bins`` records the canonical streaming packing or native
-    BatchSampler singleton grouping. Balanced placement may change those bins, but it must
-    conserve every selected key exactly once.
-
-    ``validate=False`` skips repeated scans for internally constructed, trusted
-    selections. The option is construction-only and is not serialized.
-    """
-
-    samples: tuple[BufferedSampleMetadata, ...]
-    reference_bins: tuple[tuple[SampleKey, ...], ...]
-    validate: InitVar[bool] = True
-
-    def __post_init__(self, validate: bool) -> None:
-        """Validate sample identity, stream order, and reference conservation."""
-        if not validate:
-            return
-        if not self.samples:
-            raise ValueError("StepSampleSelection.samples must not be empty.")
-        if any(not isinstance(item, BufferedSampleMetadata) for item in self.samples):
-            raise ValueError("StepSampleSelection.samples must contain BufferedSampleMetadata entries.")
-        if not self.reference_bins or any(not packing_bin for packing_bin in self.reference_bins):
-            raise ValueError("StepSampleSelection.reference_bins must contain non-empty bins.")
-        keys = tuple(item.key for item in self.samples)
-        if len(keys) != len(set(keys)):
-            raise ValueError("StepSampleSelection samples must have unique SampleKey values.")
-        positions = tuple(item.global_sample_position for item in self.samples)
-        if positions != tuple(range(positions[0], positions[0] + len(positions))):
-            raise ValueError("StepSampleSelection samples must be contiguous in canonical stream order.")
-        reference_keys = tuple(key for packing_bin in self.reference_bins for key in packing_bin)
-        if reference_keys != keys:
-            raise ValueError(
-                "StepSampleSelection reference bins must contain every selected sample exactly once "
-                "in canonical stream order."
-            )
-
-
-@dataclass(frozen=True)
 class PackingBinPlan:
     """Ordered raw samples that one Data Constructor passes to ``pack_fn``.
 
