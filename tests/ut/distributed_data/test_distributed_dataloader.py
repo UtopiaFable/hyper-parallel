@@ -174,15 +174,6 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                     loader._build_plan_control(partial)
                 self.assertIsNone(loader._build_plan_control(exhausted))
 
-    def test_external_pack_count_is_checked_by_planner(self) -> None:
-        """Removing duplicate loader checks must not accept a wrong step size."""
-        reader = _StepReader([[[{"id": 0, "tokens": 1}], [{"id": 1, "tokens": 1}]]])
-        loader = _external_loader(reader)
-
-        with self.assertRaisesRegex(ValueError, "expected 1 reference bins"):
-            next(loader)
-        self.assertEqual(reader.position, 0)
-
     def test_missing_payload_fails_before_committing_reader(self) -> None:
         """Exact Constructor membership checks prevent silently dropped samples."""
         reader = _StepReader(_steps())
@@ -194,11 +185,9 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
 
         self.assertEqual(reader.position, 0)
 
-    def test_active_step_requires_samples_and_non_none_batch(self) -> None:
-        """Empty metadata and a collator returning the EOF sentinel remain invalid."""
+    def test_active_step_requires_non_none_batch(self) -> None:
+        """A collator returning the EOF sentinel remains invalid for an active step."""
         loader = _external_loader()
-        with self.assertRaisesRegex(ValueError, "samples must not be empty"):
-            loader._build_plan_control((_ReaderSnapshot(0, False, ()),))
         with patch.object(loader._data_constructor, "construct", return_value=None):
             with self.assertRaisesRegex(ValueError, "non-None batch"):
                 next(loader)
@@ -310,18 +299,6 @@ class TestDistributedDataLoaderEndToEnd(unittest.TestCase):
                              [position * 2, position * 2 + 1])
             self.assertEqual(reader.prepare_calls, position + 1)
         self.assertFalse(hasattr(loader, "_step_sample_selector"))
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_incomplete_external_step_fails_without_refill(self) -> None:
-        """Feature: Producer-defined step boundaries.
-        Description: An invalid step must not be completed by reading samples from the next step.
-        Expectation: An incomplete external step raises without retrying fill.
-        """
-        reader = _StepReader([[]])
-        loader = _external_loader(reader)
-        with self.assertRaisesRegex(ValueError, "samples must not be empty"):
-            next(loader)
-        self.assertEqual(reader.prepare_calls, 1)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_planner_exception_propagates_before_broadcast(self) -> None:

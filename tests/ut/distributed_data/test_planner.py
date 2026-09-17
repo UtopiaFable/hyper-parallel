@@ -60,33 +60,6 @@ class TestDynamicPackingPlanner(unittest.TestCase):
     """Verify exact-set sample balancing, fallback, overflow, and stability."""
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
-    def test_direct_inputs_reject_invalid_step_membership(self) -> None:
-        """Feature: Direct Planner input validation.
-        Description: Supply empty, duplicated, missing, or unexpected sample occurrences.
-        Expectation: Invalid membership is rejected before cost estimation or placement.
-        """
-        samples = (_candidate(0, 2), _candidate(1, 2))
-        first, second = (sample.key for sample in samples)
-        reference_bins = ((first,), (second,))
-        cases = (
-            ((), reference_bins, 0, "samples must not be empty"),
-            (samples, reference_bins, -1, "step must be"),
-            (samples, ((first, second),), 0, "expected 2 reference bins"),
-            (samples[:1], reference_bins, 0, "1 samples for 2"),
-            (samples, ((), (first, second)), 0, "non-empty bins"),
-            ((samples[0], samples[0]), ((first,), (first,)), 0, "unique SampleKey"),
-            (samples, ((first,), (first,)), 0, "every selected sample exactly once"),
-            (samples, ((first,), (SampleKey(0, 99),)), 0, "every selected sample exactly once"),
-            (samples, ((first, second), (second,)), 0, "every selected sample exactly once"),
-        )
-        planner = DynamicPackingPlanner(data_parallel_size=2, seq_len=8, local_batch_size=1)
-        with patch.object(planner, "_estimate_samples") as estimate:
-            for candidates, bins, step, message in cases:
-                with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
-                    planner.plan(candidates, reference_bins=bins, step=step)
-            estimate.assert_not_called()
-
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
     def test_repeated_dataset_indices_remain_distinct_occurrences(self) -> None:
         """Feature: Sample occurrence identity.
         Description: Plan two occurrences of the same Dataset index.

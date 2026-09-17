@@ -71,6 +71,9 @@ The Planner consumes the step's metadata and original grouping directly:
 their `SampleKey` values grouped in original data-rank/bin order. This does not
 select or read additional samples. Original bins remain available for cost
 comparison and fallback.
+The caller is responsible for a complete, valid step and reference grouping;
+the Planner does not repeat request validation. Placement capacity enforcement
+and the final sample-conservation audit (when `validate=True`) remain unchanged.
 
 ## Public API
 

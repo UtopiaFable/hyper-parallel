@@ -148,8 +148,12 @@ class DynamicPackingPlanner:
 
         Returns:
             Full plan containing exactly the selected sample keys.
+
+        Note:
+            The caller supplies a complete, valid step and reference grouping.
+            Request validation is not repeated here; placement capacities and
+            the configured final plan audit still apply.
         """
-        self._validate_plan_request(samples, reference_bins, step)
         samples = self._estimate_samples(samples)
         ordered = self._validate_and_order(samples)
         bins = [
@@ -232,35 +236,6 @@ class DynamicPackingPlanner:
             return True
         gain = (reference_max - balanced_max) / reference_max
         return gain < self.min_balance_gain
-
-    def _validate_plan_request(
-            self,
-            samples: Sequence[BufferedSampleMetadata],
-            reference_bins: Sequence[Sequence[SampleKey]],
-            step: int,
-    ) -> None:
-        if not samples:
-            raise ValueError("Step samples must not be empty.")
-        if self._validate and (not isinstance(step, int) or isinstance(step, bool) or step < 0):
-            raise ValueError(f"step must be a non-negative integer, but got {step!r}.")
-        if len(reference_bins) != self.distributed_bin_count:
-            raise ValueError(
-                f"Step selection expected {self.distributed_bin_count} reference bins, "
-                f"but got {len(reference_bins)}."
-            )
-        if len(samples) < self.distributed_bin_count:
-            raise ValueError(
-                f"Step selection has {len(samples)} samples for {self.distributed_bin_count} non-empty bins."
-            )
-        if self._validate:
-            if any(not packing_bin for packing_bin in reference_bins):
-                raise ValueError("reference_bins must contain non-empty bins.")
-            sample_keys = {item.key for item in samples}
-            if len(sample_keys) != len(samples):
-                raise ValueError("Step samples must have unique SampleKey values.")
-            reference_keys = tuple(key for packing_bin in reference_bins for key in packing_bin)
-            if len(reference_keys) != len(samples) or set(reference_keys) != sample_keys:
-                raise ValueError("Reference bins must contain every selected sample exactly once.")
 
     def _place_samples(
             self,
