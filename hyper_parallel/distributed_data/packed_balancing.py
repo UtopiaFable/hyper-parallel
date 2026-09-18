@@ -22,6 +22,8 @@ from dataclasses import asdict, dataclass
 from threading import Thread
 from typing import TYPE_CHECKING, Any
 
+import torch  # pylint: disable=forbidden-backend-import
+
 from hyper_parallel.distributed_data.balance_logging import log_balance_stats
 from hyper_parallel.distributed_data.balancing_algorithm import BalancingAlgorithm, resolve_balancing_algorithm
 from hyper_parallel.distributed_data.cost_model import CostModel, resolve_cost_model
@@ -104,6 +106,17 @@ class _LocalBalancingIterator(Iterator[Any]):
 
     def _run_prefetch(self) -> None:
         try:
+            # ``torch.npu``/``torch.cuda`` keeps the current device per host
+            # thread.  The balancing producer performs HCCL/NCCL collectives
+            # from this background thread, so establish the same rank-local
+            # device here before constructing or staging the batch.
+            communication_device = getattr(self._loader._transport, "communication_device", None)
+            if communication_device is not None:
+                device = torch.device(communication_device)
+                if device.type == "npu":
+                    torch.npu.set_device(device)
+                elif device.type == "cuda":
+                    torch.cuda.set_device(device)
             self._result = self._collect_batch()
         except BaseException as exc:
             self._error = exc
