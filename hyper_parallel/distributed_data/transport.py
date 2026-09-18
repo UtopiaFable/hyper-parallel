@@ -707,6 +707,11 @@ class DataPlaneTransport:
         """Return the rank-local accelerator used by payload collectives."""
         return self._communication_device
 
+    @property
+    def communication_backend(self) -> str:
+        """Return the backend used by this data-plane control group."""
+        return _control_backend(self._control_group)
+
     def all_gather_object(self, value: Any) -> tuple[Any, ...]:
         """Gather small control objects on every data-plane rank.
 

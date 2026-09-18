@@ -70,7 +70,16 @@ class _LocalBalancingIterator(Iterator[Any]):
             raise StopIteration
         try:
             if self._thread is None:
-                self._start_prefetch()
+                if self._loader._uses_synchronous_collectives:
+                    # HCCL/NCCL collectives from a producer thread can be
+                    # interleaved with model collectives in a different order
+                    # on different ranks.  Keep accelerator data collectives
+                    # on the training thread so every rank observes one
+                    # deterministic collective sequence.  Gloo keeps the
+                    # speculative one-step host/device buffer below.
+                    self._result = self._collect_batch()
+                else:
+                    self._start_prefetch()
             self.wait_for_prefetch()
             self._thread = None
             if self._error is not None:
@@ -84,7 +93,7 @@ class _LocalBalancingIterator(Iterator[Any]):
             raise
         self._step += 1
         self._loader.last_balance_stats = result.stats
-        if not self._limit_reached():
+        if not self._limit_reached() and not self._loader._uses_synchronous_collectives:
             self._start_prefetch()
         return self._loader._deliver_batch(result, self._step)
 
@@ -182,6 +191,12 @@ class LocalBalancingDataLoader:
         self._device_prefetch = device_prefetch
         self._device_batch = None
         self._balance_stats_callback = balance_stats_callback
+
+    @property
+    def _uses_synchronous_collectives(self) -> bool:
+        """Whether data collectives must stay on the training thread."""
+        backend = getattr(self._transport, "communication_backend", "gloo").lower()
+        return "hccl" in backend or "nccl" in backend
 
     def __len__(self) -> int:
         """Return the configured step limit, or the source length when available."""
