@@ -539,9 +539,11 @@ device only for final H2D. Shared metadata mode bypasses payload transport entir
 
 ## Buffered node-local balancing
 
-For automatic Host/H2D double buffering around an existing rank-local loader,
-v1 cost estimation, Gloo node-local LPT balancing and rank-zero DP logs, see
+For automatic Host/H2D buffering around an existing rank-local loader, v1 cost
+estimation, node-local LPT balancing and rank-zero DP logs, see
 [the reference configuration](NODE_LOCAL_BALANCING.md). Supply `model_config`
 to use the default cost, or provide `cost_model`. A custom
 `balancing_algorithm` owns assignment and its scalar objective; Hyper applies
 the shared `min_balance_gain` acceptance threshold before sample exchange.
+Gloo uses a speculative producer thread; HCCL/NCCL keeps data collectives on
+the training thread to preserve ordering with model collectives.

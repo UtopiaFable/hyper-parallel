@@ -12,6 +12,11 @@ the candidate's relative objective improvement is strictly greater than
 retain the original distribution. Metadata gathering and planning still occur
 when sample exchange is skipped.
 
+When HCCL or NCCL is selected, data-plane collectives stay on the training
+thread so their order cannot race model collectives issued by another thread.
+Gloo keeps the speculative one-step Host/H2D producer; accelerator backends
+still use the configured copy stream for H2D after their data collective.
+
 ## Dataset-based integration
 
 Construct the config, bind the source's existing data contract once, and build
