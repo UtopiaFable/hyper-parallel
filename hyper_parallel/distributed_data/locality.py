@@ -64,13 +64,13 @@ def _validate_startup_statuses(
         raise ValueError("Local balancing configuration or root mesh differs across WORLD ranks.")
 
 
-def _validate_communication_config(backend: str, device: Any) -> None:
+def _validate_communication_config(backend: str, device: Any, distributed: bool) -> None:
     """Validate the node-local collective backend and its rank-local device."""
     if backend not in ("gloo", "hccl"):
         raise ValueError("communication_backend must be 'gloo' or 'hccl'.")
     if backend != "hccl":
         return
-    if device is None or getattr(device, "type", None) != "npu":
+    if distributed and (device is None or getattr(device, "type", None) != "npu"):
         raise ValueError("communication_backend='hccl' requires an NPU communication_device.")
 
 
@@ -96,7 +96,7 @@ def _create_locality_groups(
         dp_dim_names: tuple[str, ...] | None = None,
         build_identity: Any = None,
         local_error: str | None = None,
-        communication_backend: str = "gloo",
+        communication_backend: str = "hccl",
         communication_device: Any = None,
 ) -> tuple[DataTopology, DataGroups]:
     """Resolve locality once and create all process groups in WORLD rank order.
@@ -114,8 +114,8 @@ def _create_locality_groups(
         WORLD communication is used only during startup. No training mesh or
         FSDP process group is modified. All ranks must call this factory together.
     """
-    _validate_communication_config(communication_backend, communication_device)
     distributed = dist.is_available() and dist.is_initialized()
+    _validate_communication_config(communication_backend, communication_device, distributed)
     rank = dist.get_rank() if distributed else 0
     world_size = dist.get_world_size() if distributed else 1
     topology = None

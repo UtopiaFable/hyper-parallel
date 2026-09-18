@@ -23,6 +23,7 @@ import torch
 
 from hyper_parallel.distributed_data.schema import SampleKey
 from hyper_parallel.distributed_data.topology import DataTopology
+from hyper_parallel.distributed_data.api import DistributedDatasetConfig
 from tests.common.mark_utils import arg_mark
 
 from hyper_parallel.distributed_data.transport import (
@@ -107,6 +108,20 @@ class TestPayloadCodec(unittest.TestCase):
 
 class TestDataPlaneTransport(unittest.TestCase):
     """Verify control metadata and payload bytes use their designated groups."""
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="unessential")
+    def test_default_communication_backend_is_hccl(self) -> None:
+        """Feature: HCCL data-plane default.
+        Description: Construct a dataset config without selecting a backend.
+        Expectation: NPU training uses HCCL unless Gloo is explicitly requested.
+        """
+        config = DistributedDatasetConfig(seq_len=8, local_batch_size=1)
+
+        self.assertEqual(config.communication_backend, "hccl")
+        self.assertEqual(
+            DistributedDatasetConfig(seq_len=8, local_batch_size=1, communication_backend="gloo").communication_backend,
+            "gloo",
+        )
 
     @staticmethod
     def _two_rank_topology() -> DataTopology:

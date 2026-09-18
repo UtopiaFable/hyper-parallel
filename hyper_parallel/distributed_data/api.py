@@ -126,10 +126,10 @@ class DistributedDatasetConfig:
             Each configured stage must
             occur in every sample's packing_costs. These limits are independent
             of cost-model balancing scores.
-        communication_backend: Backend for HP data-plane collectives. ``gloo``
-            keeps control and CPU payload communication on Gloo. ``hccl``
-            serializes control objects into accelerator tensors and requires an
-            NPU communication device.
+        communication_backend: Backend for HP data-plane collectives. ``hccl``
+            is the default for NPU training and serializes control objects into
+            accelerator tensors. ``gloo`` keeps control and CPU payload
+            communication on Gloo. HCCL requires an NPU communication device.
     """
 
     seq_len: int
@@ -149,7 +149,7 @@ class DistributedDatasetConfig:
     persistent_workers: bool = False
     min_balance_gain: float = 0.0
     packing_budgets: dict[str, float] | None = None
-    communication_backend: Literal["gloo", "hccl"] = "gloo"
+    communication_backend: Literal["gloo", "hccl"] = "hccl"
 
     def __post_init__(self) -> None:
         """Validate topology-independent configuration boundaries."""
@@ -408,7 +408,7 @@ def _resolve_metadata_mode(
         metadata: Sequence[SampleMetadata] | None,
         external_step_reader: Any | None,
         external_step_source: ExternalStepSource | None,
-        communication_backend: str = "gloo",
+        communication_backend: str = "hccl",
         communication_device: Any = None,
 ) -> bool:
     """Resolve one metadata-mode flag when external Readers are rank-local."""
@@ -821,7 +821,7 @@ def _synchronize_build_state(state: _BuildState, config: DistributedDatasetConfi
         dataset_already_sharded=dataset_already_sharded,
         local_error=state.local_error,
         external_step_mode=state.external_step_mode,
-        communication_backend=getattr(config, "communication_backend", "gloo"),
+        communication_backend=getattr(config, "communication_backend", "hccl"),
         communication_device=state.communication_device,
     )
     # Consumer-only ranks have no reader object, but must share selection mode
@@ -951,8 +951,9 @@ def build_distributed_dataloader(
         A DistributedDataset or external_step_source uses pure DP, node-local
         communication and buffered H2D. Every step evaluates a candidate; sample
         exchange occurs only when its objective improves by more than
-        min_balance_gain. Gloo is the default backend; HCCL transports control
-        and payload tensors on the rank-local NPU.
+        min_balance_gain. HCCL is the default backend; Gloo transports control
+        and CPU payloads on the host. HCCL transports control and payload
+        tensors on the rank-local NPU.
         Checkpoint/resume remains available only on the reader/sampler path.
         Stateful custom policies should expose configuration-versioned model_id
         or algorithm_id attributes for build/checkpoint identity.
@@ -1042,7 +1043,7 @@ def _build_distributed_dataloader_impl(
         metadata,
         external_step_reader,
         external_step_source,
-        communication_backend=getattr(config, "communication_backend", "gloo"),
+        communication_backend=getattr(config, "communication_backend", "hccl"),
         communication_device=communication_device,
     )
     state = _BuildState(

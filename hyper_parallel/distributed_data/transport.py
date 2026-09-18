@@ -175,7 +175,7 @@ def synchronize_build_preflight(
         dataset_already_sharded: bool,
         local_error: str | None,
         external_step_mode: bool = False,
-        communication_backend: str = "gloo",
+        communication_backend: str = "hccl",
         communication_device: Any = None,
 ) -> bool:
     """Validate rank-local build inputs on WORLD before creating subgroups.

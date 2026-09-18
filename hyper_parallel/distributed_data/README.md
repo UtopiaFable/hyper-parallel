@@ -333,7 +333,7 @@ longer infers step boundaries by scanning source metadata.
 Reader/sampler loading retains synchronous planning and its checkpoint
 contract. Dataset-owned and external raw-step loading automatically uses
 node-local exchange, one-step buffering and H2D. The communication backend
-defaults to Gloo and can be set to HCCL. Every path accepts independent cost and
+defaults to HCCL for NPU training and can be set to Gloo. Every path accepts independent cost and
 assignment policies; plans below the required relative improvement keep the
 original distribution. See [node-local balancing](NODE_LOCAL_BALANCING.md).
 
