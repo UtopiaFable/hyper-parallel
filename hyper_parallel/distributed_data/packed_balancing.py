@@ -443,9 +443,10 @@ def build_local_balancing_dataloader(
         max_steps: Stop before prefetching beyond the requested training steps.
 
     Returns:
-        A local-step loader using node-local Gloo, automatic one-step buffering
-        and final H2D prefetch. Each step retains its source packs unless the
-        candidate improves its objective by more than min_balance_gain.
+        A local-step loader using the configured node-local communication
+        backend, automatic one-step buffering and final H2D prefetch. Each step
+        retains its source packs unless the candidate improves its objective by
+        more than min_balance_gain.
 
     Note:
         All ranks must consume the same number of steps. Checkpoint/resume and
@@ -486,11 +487,14 @@ def build_local_balancing_dataloader(
         }, sort_keys=True)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
+    communication_device = device if config.communication_backend == "hccl" else None
     topology, groups = _create_locality_groups(
         mesh,
         dp_dim_names=config.dp_dim_names,
         build_identity=identity,
         local_error=error,
+        communication_backend=config.communication_backend,
+        communication_device=communication_device,
     )
     planner = DynamicPackingPlanner(
         data_parallel_size=len(groups.data_plane_ranks),
@@ -510,7 +514,11 @@ def build_local_balancing_dataloader(
         pack_fn=pack_fn,
         collate_fn=collate_fn,
         planner=planner,
-        transport=DataPlaneTransport(groups, topology.global_rank),
+        transport=DataPlaneTransport(
+            groups,
+            topology.global_rank,
+            communication_device=communication_device,
+        ),
         global_rank=topology.global_rank,
         bin_stats_fn=bin_stats_fn,
         device_prefetch=device_prefetch,
