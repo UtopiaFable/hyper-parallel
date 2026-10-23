@@ -19,8 +19,9 @@
 
 These operators delegate to the platform-specific ``custom_ops`` interface.
 On MindSpore they wrap Ascend NPU custom C++ kernels through the
-``DFunction`` distributed dispatch framework.  On PyTorch they raise
-``NotImplementedError``.
+``DFunction`` distributed dispatch framework. Fused custom kernels raise
+``NotImplementedError`` on PyTorch; the stateful chunk delta-rule math runs
+on both backends using native differentiable tensor operations.
 
 Usage::
 
@@ -47,6 +48,8 @@ __all__ = [
     "npu_sparse_lightning_indexer_grad_kl_loss",
     "npu_sparse_lightning_indexer_kl_loss_grad",
     "npu_chunk_kda",
+    "chunk_kda_state_summary",
+    "chunk_kda_with_state",
 ]
 
 from hyper_parallel.custom_ops.experimental.experimental_ops import (
@@ -64,4 +67,6 @@ from hyper_parallel.custom_ops.experimental.experimental_ops import (
     npu_sparse_lightning_indexer_grad_kl_loss,
     npu_sparse_lightning_indexer_kl_loss_grad,
     npu_chunk_kda,
+    chunk_kda_state_summary,
+    chunk_kda_with_state,
 )

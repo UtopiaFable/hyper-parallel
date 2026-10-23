@@ -26,8 +26,9 @@ from mindspore import mint, nn
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "mindspore")
 
 from hyper_parallel import init_device_mesh, ContextParallel, AsyncContextParallel, get_platform
-from hyper_parallel.core.context_parallel import CausalConvContextParallel
+from hyper_parallel.core.context_parallel import CausalConvContextParallel, RecurrentContextParallel
 from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.custom_ops.experimental import chunk_kda_state_summary, chunk_kda_with_state
 
 
 def _init_dist(expected_world_size: int):
@@ -526,3 +527,70 @@ def test_context_parallel_local_inputs_and_halo_2() -> None:
 def test_context_parallel_local_inputs_and_halo_4() -> None:
     """Qualify local projected attention and causal convolution on four ranks."""
     _check_local_inputs_and_causal_halo(4)
+
+
+class _DeltaCore(nn.Cell):
+    """Local stateful math behind the generic affine CP boundary."""
+
+    def state_summary(self, query: ms.Tensor, key: ms.Tensor, value: ms.Tensor,
+                      gate: ms.Tensor, beta: ms.Tensor) -> tuple:
+        """Describe this local sequence independently of its incoming state."""
+        del query
+        return chunk_kda_state_summary(key, value, gate, beta, chunk_size=4)
+
+    def construct(self, query: ms.Tensor, key: ms.Tensor, value: ms.Tensor,
+                  gate: ms.Tensor, beta: ms.Tensor, initial_state: Optional[ms.Tensor] = None) -> ms.Tensor:
+        """Compute local outputs with complete initial-state gradients."""
+        return chunk_kda_with_state(query, key, value, gate, beta, initial_state, 3 ** -.5, 4)[0]
+
+
+def _delta_recurrence(query: ms.Tensor, key: ms.Tensor, value: ms.Tensor,
+                      gate: ms.Tensor, beta: ms.Tensor) -> ms.Tensor:
+    """Independent serial token recurrence without affine composition."""
+    state = mint.zeros((2, 1, 3, 5), dtype=ms.float32)
+    outputs = []
+    for token in range(query.shape[1]):
+        state = state * mint.exp(gate[:, token]).unsqueeze(-1)
+        delta = beta[:, token].unsqueeze(-1) * (
+            value[:, token] - mint.matmul(key[:, token].unsqueeze(-2), state).squeeze(-2))
+        state = state + key[:, token].unsqueeze(-1) * delta.unsqueeze(-2)
+        outputs.append(mint.matmul(query[:, token].unsqueeze(-2), state).squeeze(-2) * 3 ** -.5)
+    return mint.stack(outputs, dim=1)
+
+
+def test_recurrent_cp_more_ranks_than_heads() -> None:
+    """Compare CP4/H1 output and all input gradients, including a last-rank-only loss."""
+    rank, size = _init_dist(4)
+    mesh = init_device_mesh("npu", (size,), mesh_dim_names=("cp",))
+    rng = np.random.default_rng(723)
+    shapes = ((2, 20, 1, 3), (2, 20, 1, 3), (2, 20, 1, 5), (2, 20, 1, 3), (2, 20, 1))
+    arrays = [rng.normal(0, .2, shape).astype(np.float32) for shape in shapes]
+    arrays[3] = -np.abs(arrays[3]) * .5
+    arrays[4] = np.abs(arrays[4])
+    full = tuple(ms.Tensor(x) for x in arrays)
+    local = tuple(x[:, rank * 5:(rank + 1) * 5] for x in full)
+    core = RecurrentContextParallel().apply(_DeltaCore(), mesh)
+    _assert_close(core(*local), _delta_recurrence(*full)[:, rank * 5:(rank + 1) * 5],
+                  rank, "recurrent output", atol=2e-6, rtol=2e-4)
+    for only_last_loss in (False, True):
+        weights = rng.normal(size=(2, 20, 1, 5)).astype(np.float32)
+        if only_last_loss:
+            weights[:, :15] = 0
+        full_weight = ms.Tensor(weights)
+        local_weight = full_weight[:, rank * 5:(rank + 1) * 5]
+
+        def local_loss(*values: ms.Tensor) -> ms.Tensor:
+            """Differentiate the local loss through the state scan."""
+            return (core(*values) * local_weight).sum()
+
+        def full_loss(*values: ms.Tensor) -> ms.Tensor:
+            """Differentiate the independent full-sequence recurrence."""
+            return (_delta_recurrence(*values) * full_weight).sum()
+
+        gradients = ms.grad(local_loss, (0, 1, 2, 3, 4))(*local)
+        expected = ms.grad(full_loss, (0, 1, 2, 3, 4))(*full)
+        for index, (grad, reference) in enumerate(zip(gradients, expected)):
+            _assert_close(grad, reference[:, rank * 5:(rank + 1) * 5], rank,
+                          f"recurrent gradient {index}", atol=3e-6, rtol=3e-4)
+        if only_last_loss and rank == 0:
+            assert np.max(np.abs(gradients[2].asnumpy())) > 1e-12

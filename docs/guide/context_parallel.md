@@ -232,3 +232,38 @@ CausalConvContextParallel(kernel_size - 1).apply(attention.conv1d, cp_mesh)
 注意力使用已有的 `ContextParallel(qkv_indices=..., use_local_output=True)`。
 本地融合核在数学边界将输入 DTensor 转为本地 Tensor，并按输入布局封装输出，
 序列/head 重分布和反向继续由现有 ContextParallel 管理，无须新增本地输入选项。
+
+
+## 沿序列切分的仿射递推 CP
+
+对于满足 `S_out = A @ S_in + B` 的递推模块，可以使用
+`RecurrentContextParallel` 保持序列分片，通过递归倍增的前缀扫描得到各段的输入状态。
+模块提供可微的 `state_summary(*inputs) -> (A, B)`，并在 forward 中接收 `initial_state`。
+`A` 为方阵，`B` 的前导维与 `A` 相同；KDA 使用 `[B,H,Dk,Dk]` 和 `[B,H,Dk,Dv]`。
+摘要必须只依赖本段输入，不能依赖假定的前段状态。
+
+```python
+from hyper_parallel.core.context_parallel import RecurrentContextParallel, CausalConvContextParallel
+
+RecurrentContextParallel().apply(attention.core_attention, cp_mesh)
+CausalConvContextParallel(kernel_size - 1).apply(attention.conv1d, cp_mesh)
+```
+
+该策略不切 head，也不收集全局 Q/K/V，CP 度数不要求整除 head 数；TP 仍可独立按 head 切分。
+CP mesh 应按时间顺序递增排列。一轮扫描只交换固定大小的 FP32 状态矩阵，
+通信轮数为 `ceil(log2(CP)) + 1`（CP1 无跨卡通信），支持非二次幂的 CP 度数。
+反向通过可微集合通信将后段的状态梯度传回前段；首段的环回状态置零，但保留集合通信依赖。
+原模块仍持有参数和数学计算，策略仅注入前缀状态，不创建模型专用 CP 模块。
+
+KDA 的局部数学接口位于 experimental API：
+`chunk_kda_state_summary(k, v, g, beta)` 返回仿射摘要；
+`chunk_kda_with_state(q, k, v, g, beta, initial_state, scale)` 返回本段输出和最终状态。
+输入采用 BSHD/BSH，gate 为非正的自然对数衰减；支持尾块与初始/最终状态梯度。
+这条路径在 Torch 和 MindSpore 上使用 FP32 chunk 分解，并逐 chunk 重算中间量。
+严格下三角求逆通过有限幂积完成，不依赖后端三角求解算子。
+它不使用尚未提供 dht/dh0 的 fused ChunkKdaBwd；现有零状态 fused 路径保持原行为。
+
+该实现用于打通 head 数不限制 CP 的训练路径。局部摘要和状态输出会增加计算，
+长序列、大规模吞吐和扩展效率需要单独测量，不能将小规模正确性测试视为性能验收。
+
+该进阶路径保留为实验参考，后续可由支持状态梯度的 CANN KDA 融合算子替换。

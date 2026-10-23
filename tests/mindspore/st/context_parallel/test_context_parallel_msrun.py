@@ -78,3 +78,9 @@ def test_context_parallel_local_boundaries_msrun():
         ("test_context_parallel_local_inputs_and_halo_2", 13520, 2, 2),
         ("test_context_parallel_local_inputs_and_halo_4", 13540, 4, 4),
     )
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_recurrent_context_parallel_msrun():
+    """Check head-independent CP4 outputs and reverse state-gradient communication."""
+    _run_group(("test_recurrent_cp_more_ranks_than_heads", 13560, 4, 4))

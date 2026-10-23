@@ -19,11 +19,10 @@ which routes to the platform-specific Ascend NPU custom C++ kernel.
 """
 from typing import Optional, Tuple
 
-from mindspore import Tensor
-
 from hyper_parallel.platform import get_platform
 
 _platform = get_platform()
+Tensor = _platform.Tensor
 
 _MAX_INT64 = 9223372036854775807
 
@@ -619,6 +618,29 @@ def npu_sparse_lightning_indexer_kl_loss_grad(
         cu_seq_lens_q, cu_seq_lens_k, seqused_q, seqused_k, cmp_residual_k,
         layout, mask_mode, cmp_ratio,
     )
+
+
+def chunk_kda_state_summary(k: Tensor, v: Tensor, g: Tensor, beta: Tensor,
+                            chunk_size: int = 64, recompute: bool = True) -> Tuple:
+    """Return differentiable FP32 (A,B) for the local segment's S_out=A@S_in+B.
+
+    Inputs use dense BSHD/BSH layouts; this stateful math path uses native
+    matmuls with chunk recomputation, independently of the fused zero-state OPP.
+    """
+    return _platform.chunk_kda_stateful(None, k, v, g, beta, None, 1.0,
+                                       chunk_size, summary_only=True, recompute=recompute)
+
+
+def chunk_kda_with_state(q: Tensor, k: Tensor, v: Tensor, g: Tensor, beta: Tensor,
+                         initial_state: Optional[Tensor], scale: float, chunk_size: int = 64,
+                         recompute: bool = True) -> Tuple:
+    """Return BSHD KDA output and final state with complete state gradients.
+
+    Native differentiable chunk math handles initial/final states in FP32;
+    forward intermediates are recomputed per chunk to bound activation storage.
+    """
+    return _platform.chunk_kda_stateful(q, k, v, g, beta, initial_state, scale,
+                                       chunk_size, summary_only=False, recompute=recompute)
 
 
 def _validate_chunk_kda_autograd_options(initial_state, disable_recompute, state_v_first):

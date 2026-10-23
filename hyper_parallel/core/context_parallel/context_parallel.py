@@ -508,6 +508,79 @@ class CausalConvContextParallel(ParallelStyle):
         return tuple(new_args), new_kwargs
 
 
+class RecurrentContextParallel(ParallelStyle):
+    """Keep sequences sharded and scan affine recurrent state maps across ranks.
+
+    This is a local-tensor boundary. The module supplies ``state_summary(*inputs) -> (A,B)`` describing
+    ``state_out = A @ state_in + B``, and consumes ``initial_state`` in forward.
+    States are FP32; no token tensors or head shards are exchanged. Recursive
+    doubling uses O(log(CP)) rounds and supports non-power-of-two mesh sizes.
+
+    Args:
+        summary_method: Module method that computes its differentiable local map.
+        state_kwarg: Forward keyword receiving the preceding segment's state.
+    """
+
+    def __init__(self, summary_method: str = "state_summary", state_kwarg: str = "initial_state") -> None:
+        """Configure a generic affine recurrence boundary."""
+        super().__init__()
+        if (not isinstance(summary_method, str) or not summary_method
+                or not isinstance(state_kwarg, str) or not state_kwarg):
+            raise ValueError("A recurrent CP boundary requires summary and state keyword names.")
+        self.summary_method = summary_method
+        self.state_kwarg = state_kwarg
+
+    def apply(self, module: Module, device_mesh: DeviceMesh) -> Module:
+        """Register a state-prefix hook, preserving the original module and parameters."""
+        mesh = _ensure_1d(device_mesh)
+        if tuple(mesh.rank_list) != tuple(sorted(mesh.rank_list)):
+            raise ValueError("Recurrent CP requires ascending ranks in chronological token order.")
+        if not callable(getattr(module, self.summary_method, None)):
+            raise ValueError(f"Recurrent CP requires module.{self.summary_method}().")
+        module.register_forward_pre_hook(partial(self._prepare_state, mesh=mesh), with_kwargs=True)
+        return module
+
+    @staticmethod
+    def _shift(tensor: Tensor, distance: int, mesh: DeviceMesh) -> Tensor:
+        """Exchange a fixed-size state with one peer, including differentiable wraparound."""
+        size, rank = mesh.size(), mesh.get_local_rank()
+        flat = tensor.contiguous().reshape(-1)
+        send, recv = [0] * size, [0] * size
+        send[(rank + distance) % size] = flat.numel()
+        recv[(rank - distance) % size] = flat.numel()
+        result = platform.differentiable_all_to_all_single(flat, send, recv, mesh.get_group())
+        return result.reshape(tensor.shape)
+
+    def _prepare_state(self, module: Module, args: tuple, kwargs: dict, mesh: DeviceMesh) -> tuple:
+        """Compute the exclusive state prefix while retaining every backward collective."""
+        if kwargs.get(self.state_kwarg) is not None:
+            raise ValueError("Recurrent CP cannot replace an explicit initial state.")
+        args = tuple(value.to_local() if isinstance(value, DTensor) else value for value in args)
+        kwargs = dict(kwargs)
+        kwargs.pop(self.state_kwarg, None)
+        kwargs = {name: value.to_local() if isinstance(value, DTensor) else value for name, value in kwargs.items()}
+        transition, bias = getattr(module, self.summary_method)(*args, **kwargs)
+        if (len(transition.shape) < 2 or transition.shape[-1] != transition.shape[-2]
+                or tuple(transition.shape[:-1]) != tuple(bias.shape[:-1])):
+            raise ValueError("State summary must return compatible square A and rectangular B matrices.")
+        distance, rank = 1, mesh.get_local_rank()
+        while distance < mesh.size():
+            packed = platform.cat((transition, bias), dim=-1)
+            previous = self._shift(packed, distance, mesh)
+            split = transition.shape[-1]
+            prev_a, prev_b = previous[..., :split], previous[..., split:]
+            if rank >= distance:
+                bias = transition @ prev_b + bias
+                transition = transition @ prev_a
+            else:
+                # Keep identical collective dependencies even on the leading ranks.
+                transition, bias = transition + prev_a * 0, bias + prev_b * 0
+            distance *= 2
+        initial = self._shift(bias, 1, mesh) if mesh.size() > 1 else bias
+        kwargs[self.state_kwarg] = initial * 0 if rank == 0 else initial
+        return args, kwargs
+
+
 class ContextParallel(ParallelStyle):
     """Unified Context Parallel for core-attention modules.
 

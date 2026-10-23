@@ -1794,6 +1794,15 @@ class MindSporePlatform(Platform):
     def register_full_backward_pre_hook(module, hook, prepend=False):
         return module.register_backward_pre_hook(hook)
 
+    @staticmethod
+    def chunk_kda_stateful(query: Any, key: Any, value: Any, gate: Any, beta: Any,
+                           initial_state: Any, scale: float, chunk_size: int = 64,
+                           summary_only: bool = False, recompute: bool = True) -> tuple:
+        """Use MindSpore's native autograd for chunk outputs and affine state maps."""
+        from hyper_parallel.platform.mindspore.chunk_delta import chunk_kda_stateful  # pylint: disable=C0415
+        return chunk_kda_stateful(query, key, value, gate, beta, initial_state,
+                                 scale, chunk_size, summary_only, recompute)
+
     @property
     def checkpoint(self):
         return ms.recompute

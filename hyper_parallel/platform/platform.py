@@ -1370,6 +1370,17 @@ class Platform:
         """
         return module.register_full_backward_pre_hook(hook, prepend)
 
+    @staticmethod
+    def chunk_kda_stateful(query: Any, key: Any, value: Any, gate: Any, beta: Any,
+                           initial_state: Any, scale: float, chunk_size: int = 64,
+                           summary_only: bool = False, recompute: bool = True) -> tuple:
+        """Run differentiable local chunk KDA with affine state boundaries.
+
+        The summary mode returns (A,B) for S_out=A@S_in+B. Otherwise return
+        (output, final_state), including gradients of both boundary states.
+        """
+        raise NotImplementedError("Stateful chunk KDA is not implemented for this platform")
+
     @property
     def checkpoint(self):
         """Get the checkpoint function for activation checkpointing.
