@@ -40,8 +40,11 @@ from hyper_parallel.core.context_parallel.context_parallel import (
 from hyper_parallel.core.context_parallel.async_dsa_context_parallel import _AsyncSequenceReplicateSlot
 from hyper_parallel.core.context_parallel.dsa_context_parallel import (
     DSASequenceReplicateCache,
+    _DSASequenceReplicateGradientBridge,
+    _DSAPackedKVSplit,
     _to_sequence_replicate,
 )
+from hyper_parallel.core.shard.ops import dsa_cp_fold as fold
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh, _DEVICE_MESH_MAP
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
@@ -63,6 +66,13 @@ class _IdentityModule(nn.Module):
     def forward(self, *args, **kwargs):
         if kwargs:
             return args, kwargs
+        return args
+
+
+class _SparseIdentityModule(nn.Module):
+    """Compute boundary that accepts tensors but no parallel-source hints."""
+
+    def forward(self, *args):
         return args
 
 
@@ -120,6 +130,189 @@ class TestDsaContextParallel(unittest.TestCase):
             init_backend=False,
         )
         return root["cp"], root["tp"]
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_indexer_scope_reuses_value_preserves_gradients_and_updates(self, mock_mesh_platform):
+        """Two updates, nested calls and exceptions cannot reuse another call's K."""
+        mesh = self._make_cp_mesh(mock_mesh_platform)
+        cache = DSASequenceReplicateCache(scoped=True)
+        indexer = _IdentityModule()
+        selector_style = DSAIndexerContextParallel(shared_replicate_cache=cache)
+        selector_style.apply(indexer, mesh)
+        weight = torch.randn(1, 4, 1, 8, requires_grad=True)
+        with _patch_torch_dist_rank(), patch.object(mesh, "get_group", return_value=None), patch(
+                "hyper_parallel.core.context_parallel.dsa_context_parallel._to_sequence_replicate",
+                wraps=_to_sequence_replicate) as gather:
+            for _ in range(2):
+                source = weight * 2
+                selector_input = source.detach().requires_grad_()
+                with cache.scope():
+                    cache.bind_indexer_source(source, selector_input)
+                    selected = indexer(source, selector_input, source)[1].to_local()
+                    cache.begin()  # SFA must not erase the selector value.
+                    with cache.scope():
+                        other = source + 10
+                        cache.bind_indexer_source(other, other)
+                        nested = cache.replicate("key_indexer", other, mesh, 1).to_local()
+                        self.assertTrue(torch.equal(nested, other))
+                    kl = cache.replicate("key_indexer", source, mesh, 1).to_local()
+                    self.assertEqual(selected.data_ptr(), kl.data_ptr())
+                    # Same metadata without a declared source must fall back.
+                    alien = source + 20
+                    separate = cache.replicate("key_indexer", alien, mesh, 1).to_local()
+                    self.assertTrue(torch.equal(separate, alien))
+                    cache.clear()
+                    (kl.sum() * 3).backward()
+                self.assertTrue(torch.equal(weight.grad, torch.full_like(weight, 6)))
+                self.assertIsNone(selector_input.grad)
+                self.assertFalse(cache._values)
+                with torch.no_grad():
+                    weight.add_(-0.01 * weight.grad)
+                weight.grad = None
+            self.assertEqual(gather.call_count, 6)
+            with self.assertRaisesRegex(RuntimeError, "scope abort"):
+                with cache.scope():
+                    cache.bind_indexer_source(weight, weight)
+                    cache.replicate("key_indexer", weight, mesh, 1)
+                    raise RuntimeError("scope abort")
+            self.assertFalse(cache._values)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_selector_sfa_kl_hooks_share_three_gathers(self, mock_mesh_platform):
+        """The actual three boundaries must share K_index across the SFA begin hook."""
+        mesh = self._make_cp_mesh(mock_mesh_platform)
+        cache = DSASequenceReplicateCache(scoped=True)
+        selector, attention, loss = (_IdentityModule() for _ in range(3))
+        DSAIndexerContextParallel(shared_replicate_cache=cache).apply(selector, mesh)
+        DSASparseAttentionContextParallel(shared_replicate_cache=cache, share_key_value=True).apply(attention, mesh)
+        q = torch.randn(1, 4, 2, 8)
+        k, ki, kr = (torch.randn(1, 4, 1, 8) for _ in range(3))
+        w = torch.randn(1, 4, 2)
+        selector_input = ki.detach()
+        with _patch_torch_dist_rank(), patch.object(mesh, "get_group", return_value=None), patch(
+                "hyper_parallel.core.context_parallel.dsa_context_parallel._to_sequence_replicate",
+                wraps=_to_sequence_replicate) as gather:
+            DSAIndexerLossContextParallel(shared_replicate_cache=cache).apply(loss, mesh)
+            with cache.scope():
+                cache.bind_indexer_source(ki, selector_input)
+                selected = selector(q, selector_input, w)
+                attended = attention(q, k, k, q, q, kr)
+                result = loss(q, k, q, ki, w, q, q, q, q, kr)
+                self.assertEqual(selected[1].to_local().data_ptr(), result[3].to_local().data_ptr())
+                self.assertEqual(attended[1].to_local().data_ptr(), result[1].to_local().data_ptr())
+                self.assertFalse(cache._values)
+            self.assertEqual(gather.call_count, 3)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_explicit_kv_source_merges_gradient_bridge(self, mock_mesh_platform):
+        """Only the declared producer source may own both K and V gradients."""
+        mesh = self._make_cp_mesh(mock_mesh_platform)
+        for explicit in (False, True):
+            for used in ((1,), (2,), (1, 2)):
+                cache = DSASequenceReplicateCache(scoped=True)
+                module = _SparseIdentityModule()
+                DSASparseAttentionContextParallel(shared_replicate_cache=cache, share_key_value=True,
+                                                 merge_key_value_grad=True).apply(module, mesh)
+                source = torch.randn(1, 4, 1, 8, requires_grad=True)
+                key = source * 1
+                with _patch_torch_dist_rank(), patch.object(mesh, "get_group", return_value=None), patch.object(
+                        _DSASequenceReplicateGradientBridge, "apply",
+                        wraps=_DSASequenceReplicateGradientBridge.apply) as bridge:
+                    with cache.scope():
+                        output = module(source, key, source, source,
+                                        shared_kv_source=source if explicit else None)
+                        sum(output[index].to_local().sum() for index in used).backward()
+                self.assertTrue(torch.equal(source.grad, torch.full_like(source, len(used))))
+                self.assertEqual(bridge.call_count, 1 if explicit else 2)
+                if explicit:
+                    self.assertIs(output[1], output[2])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_packed_kv_rope_uses_one_replica_bridge(self, mock_mesh_platform):
+        """Packed producer routes K/V to latent and RoPE to its own source once."""
+        mesh = self._make_cp_mesh(mock_mesh_platform)
+        for layout in ("BSND", "TND"):
+            for mismatch in (False, True):
+                cache = DSASequenceReplicateCache(scoped=True)
+                module = _SparseIdentityModule()
+                DSASparseAttentionContextParallel(layout=layout, shared_replicate_cache=cache, share_key_value=True,
+                                                 merge_key_value_grad=True, pack_key_rope=True).apply(module, mesh)
+                latent = torch.randn((1, 4, 1, 8) if layout == "BSND" else (4, 1, 8), requires_grad=True)
+                rope = torch.randn(latent.shape[:-1] + (4,), dtype=torch.float64 if mismatch else torch.float32,
+                                   requires_grad=True)
+                packed = torch.cat((latent, rope.to(torch.float32)), dim=-1)
+                with _patch_torch_dist_rank(), patch.object(mesh, "get_group", return_value=None), patch.object(
+                        _DSASequenceReplicateGradientBridge, "apply",
+                        wraps=_DSASequenceReplicateGradientBridge.apply) as bridge:
+                    with cache.scope():
+                        output = module(latent, latent * 1, latent, latent, latent, rope,
+                                        shared_kv_source=latent, packed_key_source=packed)
+                        (output[1].to_local().sum() + output[2].to_local().sum()
+                         + output[5].to_local().sum()).backward()
+                self.assertTrue(torch.equal(latent.grad, torch.full_like(latent, 2)))
+                self.assertTrue(torch.equal(rope.grad, torch.ones_like(rope)))
+                self.assertEqual(bridge.call_count, 2 if mismatch else 1)
+                self.assertTrue(torch.equal(output[1].to_local(), latent))
+                self.assertTrue(torch.equal(output[5].to_local(), rope))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_unrelated_kv_sources_are_not_merged(self, mock_mesh_platform):
+        """Equal shapes cannot establish a common producer or redirect gradients."""
+        mesh = self._make_cp_mesh(mock_mesh_platform)
+        cache = DSASequenceReplicateCache(scoped=True)
+        module = _SparseIdentityModule()
+        DSASparseAttentionContextParallel(shared_replicate_cache=cache, share_key_value=False,
+                                         merge_key_value_grad=True, pack_key_rope=True).apply(module, mesh)
+        key = torch.randn(1, 4, 1, 8, requires_grad=True)
+        value = torch.randn_like(key, requires_grad=True)
+        with _patch_torch_dist_rank(), patch.object(mesh, "get_group", return_value=None), patch.object(
+                _DSASequenceReplicateGradientBridge, "apply",
+                wraps=_DSASequenceReplicateGradientBridge.apply) as bridge:
+            with cache.scope():
+                output = module(key, key, value, key, shared_kv_source=key)
+                (output[1].to_local().sum() + output[2].to_local().sum() * 3).backward()
+        self.assertEqual(bridge.call_count, 2)
+        self.assertTrue(torch.equal(key.grad, torch.ones_like(key)))
+        self.assertTrue(torch.equal(value.grad, torch.full_like(value, 3)))
+        self.assertTrue(torch.equal(output[1].to_local(), key))
+        self.assertTrue(torch.equal(output[2].to_local(), value))
+
+    def test_packed_split_missing_branch_gradients(self):
+        """A missing latent or RoPE branch contributes zeros without changing dtype."""
+        for dtype in (torch.float32, torch.bfloat16):
+            for used in ((0,), (1,), (0, 1)):
+                packed = torch.randn(1, 4, 1, 12, dtype=dtype, requires_grad=True)
+                values = _DSAPackedKVSplit.apply(packed, 8)
+                sum(values[index].sum() for index in used).backward()
+                expected = torch.cat((torch.full_like(packed[..., :8], int(0 in used)),
+                                      torch.full_like(packed[..., 8:], int(1 in used))), dim=-1)
+                self.assertTrue(torch.equal(packed.grad, expected))
+
+    def test_merged_prefix_grad_matches_two_scatters(self):
+        """All ranks, BF16/FP32, both sequence axes and missing branch gradients."""
+        torch.manual_seed(1729)
+        for size in (1, 2, 3, 4, 8, 32):
+            for rank in range(size):
+                for dtype in (torch.float32, torch.bfloat16):
+                    for dim in (0, 1):
+                        full_len = 2 * size * 3
+                        grads = []
+                        for block in (0, 1):
+                            length = fold.balanced_prefix_chunks(rank, size, block) * 3
+                            shape = (length, 2) if dim == 0 else (2, length, 1, 5)
+                            grads.append(torch.randn(shape, dtype=dtype))
+                        saved = [g.clone() for g in grads]
+                        for used in ((0, 1), (0,), (1,), ()):
+                            values = [grads[b] if b in used else None for b in (0, 1)]
+                            actual = fold.fold_prefix_pair_grad(*values, rank, size, full_len, dim)
+                            if not used:
+                                self.assertIsNone(actual)
+                                continue
+                            expected = sum(fold.fold_prefix_grad(grads[b], rank, size, b, full_len, dim)
+                                           for b in used)
+                            self.assertTrue(torch.equal(actual, expected), (rank, size, dtype, dim, used))
+                        for value, original in zip(grads, saved):
+                            self.assertTrue(torch.equal(value, original))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_non_cp_dtensor_enters_cp_on_composed_mesh_and_drops_cp_on_exit(self, mock_mesh_platform):

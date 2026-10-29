@@ -54,6 +54,7 @@ from contextvars import ContextVar
 from functools import lru_cache, wraps
 from typing import Any, Callable, Iterator, Optional, Sequence, Tuple
 
+
 import numpy as np
 
 from hyper_parallel.platform import get_platform
@@ -75,6 +76,7 @@ __all__ = [
     "unfold_prefix_pair",
     "unfold_prefix",
     "fold_prefix_grad",
+    "fold_prefix_pair_grad",
     "split_half",
     "fold_lightning_indexer",
     "fold_sparse_flash_attention",
@@ -420,10 +422,7 @@ class _UnfoldPrefixPair(platform.Function):
         """Both folded blocks' causal key prefixes, gathered in one pass."""
         ctx.fold_pairs = _PAIRING.get()
         full_len = x.shape[seq_dim]
-        sf = full_len // (2 * seq_shards)
-        m = (balanced_prefix_chunks(seq_shard_id, seq_shards, 0),
-             balanced_prefix_chunks(seq_shard_id, seq_shards, 1))
-        ctx.fold_args = (seq_shard_id, seq_shards, full_len, seq_dim, sf, m)
+        ctx.fold_args = (seq_shard_id, seq_shards, full_len, seq_dim)
         return (_unfold_prefix_select(x, seq_shard_id, seq_shards, 0, seq_dim),
                 _unfold_prefix_select(x, seq_shard_id, seq_shards, 1, seq_dim))
 
@@ -432,37 +431,53 @@ class _UnfoldPrefixPair(platform.Function):
         """Merged reverse of both prefixes: the shorter one is a head of the longer one,
         so add it into that head and scatter back with a single gather."""
         with fold_pairing(ctx.fold_pairs):
-            seq_shard_id, seq_shards, full_len, seq_dim, sf, m = ctx.fold_args
-            long_id = 0 if m[0] >= m[1] else 1
-            grads = (grad0, grad1)
-            g_long, g_short = grads[long_id], grads[1 - long_id]
-            if g_long is None and g_short is None:
-                return None, None, None, None
-            if g_long is None:
-                return fold_prefix_grad(g_short, seq_shard_id, seq_shards, 1 - long_id, full_len, seq_dim), \
-                    None, None, None
-            parts = []
-            short_len = m[1 - long_id] * sf
-            long_len = m[long_id] * sf
-            if g_short is not None:
-                parts.append(g_long.narrow(seq_dim, 0, short_len) + g_short)
-                if long_len > short_len:
-                    parts.append(g_long.narrow(seq_dim, short_len, long_len - short_len))
-            else:
-                parts.append(g_long)
-            zero_shape = list(g_long.shape)
-            zero_shape[seq_dim] = sf
-            parts.append(platform.zeros(tuple(zero_shape), dtype=g_long.dtype, device=g_long.device))
-            g = platform.cat(parts, dim=seq_dim)
-            g = g.reshape(_chunked_shape(g.shape, seq_dim, m[long_id] + 1))
-            g = g.index_select(seq_dim, _index_tensor(
-                build_prefix_scatter_order(seq_shard_id, seq_shards, long_id), g))
-            out_shape = list(g_long.shape)
-            out_shape[seq_dim] = full_len
-            return g.reshape(tuple(out_shape)), None, None, None
+            seq_shard_id, seq_shards, full_len, seq_dim = ctx.fold_args[:4]
+            return fold_prefix_pair_grad(grad0, grad1, seq_shard_id, seq_shards, full_len, seq_dim), None, None, None
+
+
+def fold_prefix_pair_grad(grad0: Any, grad1: Any, seq_shard_id: int, seq_shards: int,
+                          full_len: int, seq_dim: int = 1) -> Any:
+    """Merge two natural-prefix gradients and scatter once to the folded layout.
+
+    Neither input is modified; absent gradients contribute zero.
+    """
+    if seq_shards < 1 or not 0 <= seq_shard_id < seq_shards:
+        raise ValueError("Prefix gradient merge requires a valid sequence shard rank and size.")
+    if full_len <= 0 or full_len % (2 * seq_shards):
+        raise ValueError("Prefix gradient merge requires full_len divisible by twice the shard count.")
+    sf = full_len // (2 * seq_shards)
+    m = tuple(balanced_prefix_chunks(seq_shard_id, seq_shards, b) for b in (0, 1))
+    long_id = 0 if m[0] >= m[1] else 1
+    grads = (grad0, grad1)
+    g_long, g_short = grads[long_id], grads[1 - long_id]
+    if g_long is None and g_short is None:
+        return None
+    if g_long is None:
+        return fold_prefix_grad(g_short, seq_shard_id, seq_shards, 1 - long_id, full_len, seq_dim)
+    parts = []
+    short_len = m[1 - long_id] * sf
+    long_len = m[long_id] * sf
+    if g_short is not None:
+        parts.append(g_long.narrow(seq_dim, 0, short_len) + g_short)
+        if long_len > short_len:
+            parts.append(g_long.narrow(seq_dim, short_len, long_len - short_len))
+    else:
+        parts.append(g_long)
+    zero_shape = list(g_long.shape)
+    zero_shape[seq_dim] = sf
+    parts.append(platform.zeros(tuple(zero_shape), dtype=g_long.dtype, device=g_long.device))
+    g = platform.cat(parts, dim=seq_dim)
+    g = g.reshape(_chunked_shape(g.shape, seq_dim, m[long_id] + 1))
+    g = g.index_select(seq_dim, _index_tensor(
+        build_prefix_scatter_order(seq_shard_id, seq_shards, long_id), g))
+    out_shape = list(g_long.shape)
+    out_shape[seq_dim] = full_len
+    return g.reshape(tuple(out_shape))
+
 
 
 def unfold_prefix_pair(x: Any, seq_shard_id: int, seq_shards: int, seq_dim: int = 1) -> Any:
+
     """``(unfold_prefix(x, .., 0), unfold_prefix(x, .., 1))`` with one merged backward."""
     if x is None:
         return None, None
@@ -806,8 +821,7 @@ def fold_sparse_indexer_kl_loss(func: Callable, seq_shard_id: int, seq_shards: i
         d_key_index = compact_pair_grad(d_ki0, d_ki1, tuple(item[0] for item in compact_plan),
                                        tuple(build_fold_order(seq_shards)), full_len)
     else:
-        d_key_index = (fold_prefix_grad(d_ki0, seq_shard_id, seq_shards, 0, full_len, seq_dim)
-                       + fold_prefix_grad(d_ki1, seq_shard_id, seq_shards, 1, full_len, seq_dim))
+        d_key_index = fold_prefix_pair_grad(d_ki0, d_ki1, seq_shard_id, seq_shards, full_len, seq_dim)
     return (_cat_pair(d_qi0, d_qi1, seq_dim), d_key_index,
             _cat_pair(d_w0, d_w1, seq_dim), loss0 + loss1)
 

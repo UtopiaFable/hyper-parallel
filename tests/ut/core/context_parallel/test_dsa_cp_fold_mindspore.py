@@ -256,8 +256,18 @@ def test_folded_indexer_matches_full_sequence(cp_size):
 
 
 @pytest.mark.parametrize("cp_size", [2, 4])
-def test_folded_kl_loss_matches_full_sequence(cp_size):
+def test_folded_kl_loss_matches_full_sequence(cp_size, monkeypatch):
     """Query-side grads by row, key grad and loss summed over ranks, all equal the full call."""
+    seen_ranks = []
+    original_merge = fold.fold_prefix_pair_grad
+
+    def counted_merge(*args, **kwargs):
+        """Record the optimized default while retaining the real numerical implementation."""
+        seen_ranks.append(args[2])
+        return original_merge(*args, **kwargs)
+
+    monkeypatch.setenv("HP_DSA_KL_MERGE", "0")
+    monkeypatch.setattr(fold, "fold_prefix_pair_grad", counted_merge)
     seq = 2 * cp_size * 3
     rng = np.random.default_rng(3)
     q = rng.standard_normal((B, seq, N_HEADS, D)).astype(np.float32)
@@ -291,6 +301,7 @@ def test_folded_kl_loss_matches_full_sequence(cp_size):
         loss_sum = loss_sum + loss.asnumpy()
     np.testing.assert_allclose(d_k_sum, _folded_full(ref[1].asnumpy(), cp_size), rtol=1e-5, atol=1e-4)
     np.testing.assert_allclose(loss_sum, ref[3].asnumpy(), rtol=1e-5, atol=1e-4)
+    assert seen_ranks == list(range(cp_size))
 
 
 def test_fold_flag_roundtrip():
