@@ -186,6 +186,15 @@ def npu_flash_attention_varlen_v4(
     ``softmaxInLayout`` is unavailable on some Ascend platforms and the caller must keep its
     re-packing path.
 
+    For document-local sliding windows, pass ``sparse_mode=4``, a compressed
+    causal ``atten_mask`` and cumulative document ends in ``actual_seq_qlen`` /
+    ``actual_seq_kvlen``. ``pre_tokens`` and ``next_tokens`` are distances from
+    the current token: ``pre_tokens=511, next_tokens=0`` is causal width 512.
+    Plain tensors and DTensor head sharding are supported. Band mode with a
+    sequence-sharded TND query is currently rejected, because each document
+    fragment needs its own query/key alignment; do not merely remove that check.
+    DTensor statistics require ``tnd_softmax_out=True``.
+
     Returns:
         tuple[Tensor, Tensor, Tensor]: ``(softmax_max, softmax_sum, attention_out)``.
     """

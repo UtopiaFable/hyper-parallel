@@ -857,6 +857,11 @@ class FlashAttentionScoreDistributedOp(DistributedOp):
             return result[:4]
         return result
 
+    @staticmethod
+    def use_tnd_v4_kernel() -> bool:
+        """Whether a stock primitive call should opt into the custom V4 kernel."""
+        return tnd_softmax_out_enabled()
+
     def _adjust_head_num(self, head_num: int, head_split_num: int) -> int:
         """Validate and adjust head_num for head parallelism."""
         if head_split_num <= 0:
@@ -1037,7 +1042,7 @@ class FlashAttentionScoreDistributedOp(DistributedOp):
 
             def _local_kernel(q, k, v, a_qlen, a_kvlen, h_num, s_mode, pre_t, next_t):
                 """Run the local FA kernel: stock primitive, or aclnn V4 for TND statistics."""
-                if input_layout == "TND" and tnd_softmax_out_enabled():
+                if input_layout == "TND" and self.use_tnd_v4_kernel():
                     # The V4 operator takes no pse / dropout / padding / prefix inputs and
                     # always runs at keep_prob == 1.0. Refuse rather than forward a subset:
                     # dropping any of them would change the attention numerically while the

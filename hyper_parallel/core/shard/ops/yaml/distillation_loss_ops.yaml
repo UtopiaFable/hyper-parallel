@@ -1,0 +1,14 @@
+MSELossExt:
+  dist_op_name: _mse_loss_ext_dist_op
+  distributed_op_class: PointwiseLossDistributedOp
+  distributed_op_file: parallel_distillation_loss
+
+KLDiv:
+  dist_op_name: _kl_div_dist_op
+  distributed_op_class: PointwiseLossDistributedOp
+  distributed_op_file: parallel_distillation_loss
+
+LogSoftmaxExt:
+  dist_op_name: _log_softmax_ext_dist_op
+  distributed_op_class: LogSoftmaxDistributedOp
+  distributed_op_file: parallel_distillation_loss

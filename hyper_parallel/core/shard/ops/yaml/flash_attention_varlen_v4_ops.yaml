@@ -1,0 +1,4 @@
+npu_flash_attention_varlen_v4:
+  dist_op_name: _npu_flash_attention_varlen_v4_dist_op
+  distributed_op_class: NpuFlashAttentionVarLenV4DistributedOp
+  distributed_op_file: parallel_npu_flash_attention_varlen_v4
