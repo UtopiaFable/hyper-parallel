@@ -44,6 +44,7 @@ def reset_mindspore_fully_shard_shared_state() -> None:
     MindSporeHSDPStateV2.pre_direct_all_reduce_grads.clear()
     MindSporeHSDPStateV2.pre_all_reduce_groups.clear()
     MindSporeHSDPStateV2.pending_all_reduce_groups.clear()
+    MindSporeHSDPStateV2.pre_small_replica_buckets.clear()
     AllGatherMetadataCache._cache.clear()
 
 

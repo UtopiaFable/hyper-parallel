@@ -14,7 +14,7 @@
 # ============================================================================
 """MindSpore HSDP cell state"""
 from collections import defaultdict
-from typing import List, Optional
+from typing import Any, List, Optional
 import mindspore as ms
 from mindspore import ops
 import mindspore.mint.distributed as dist
@@ -36,6 +36,9 @@ from hyper_parallel.platform.mindspore.fully_shard.param_group import (
 from hyper_parallel.platform.mindspore.utils import normalize_runtime_device
 from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy
 
+_SMALL_REPLICA_MAX_NUMEL = 64
+_SMALL_REPLICA_BUCKET_MAX_NUMEL = 4096
+
 
 def _to_dtype_if_needed(
     tensor: ms.Tensor, dtype: Optional[ms.Type]
@@ -51,6 +54,42 @@ def _to_dtype_if_needed(
     return tensor
 
 
+class _SmallReplicaAllReduce:
+    """Own one small replica-gradient buffer until its asynchronous reduction completes."""
+
+    def __init__(self, entries: list, reduce_op: Any) -> None:
+        """Pack ready gradients with their original scaling and launch one reduction."""
+        self.entries = []
+        gradients = []
+        for param, gradient in entries:
+            gradient = _to_dtype_if_needed(gradient, param.reduce_dtype)
+            apply_gradient_scaling_factor(gradient, param.gradient_scaling_factor)
+            self.entries.append((param, tuple(gradient.shape), gradient.numel(), param.orig_dtype))
+            gradients.append(gradient.reshape(-1))
+        self.buffer = ms.mint.cat(gradients, dim=0)
+        self.handle = dist.all_reduce(
+            self.buffer, group=entries[0][0].unsharded_group_info.group,
+            op=reduce_op, async_op=True,
+        )
+
+    def wait_and_apply(self) -> None:
+        """Wait before reading buffer views and reuse the normal gradient writeback path."""
+        if self.handle is not None:
+            self.handle.wait()
+            self.handle = None
+        offset = 0
+        need_synchronize = False
+        for param, shape, numel, orig_dtype in self.entries:
+            gradient = self.buffer.narrow(0, offset, numel).reshape(shape)
+            need_synchronize = param.apply_reduced_grad(gradient, orig_dtype) or need_synchronize
+            offset += numel
+        # Keep the bucket alive until any asynchronous CPU writeback completes.
+        if need_synchronize:
+            ms.runtime.current_stream().synchronize()
+        self.buffer = None
+        self.entries.clear()
+
+
 class MindSporeHSDPStateV2(HSDPState):
     """MindSpore HSDP cell state"""
     # DTensor compat parameters in pure-TP mode can accumulate gradients
@@ -61,6 +100,7 @@ class MindSporeHSDPStateV2(HSDPState):
     # Reserved for HSDP fused all-reduce pipeline (phase-2); kept for API parity with Torch.
     pre_all_reduce_groups: List = []
     pending_all_reduce_groups: List = []
+    pre_small_replica_buckets: List = []
 
     @staticmethod
     def _get_pending_unsharded_grad(hsdp_param):
@@ -338,7 +378,10 @@ class MindSporeHSDPStateV2(HSDPState):
             )
 
     def _queue_replicate_params_allreduce(self) -> None:
-        """Queue async all-reduce for config.replicate_params (aligned with Torch)."""
+        """Coalesce compatible small replicas without delaying large gradient collectives."""
+        pending = []
+        pending_key = None
+        pending_numel = 0
         for hsdp_param in self.replicate_params:
             if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
                 continue
@@ -346,11 +389,45 @@ class MindSporeHSDPStateV2(HSDPState):
                 continue
             if not self._has_pending_unsharded_grad(hsdp_param):
                 continue
+            key, gradient = self._small_replica_bucket_key(hsdp_param)
+            if pending and (key != pending_key
+                            or pending_numel + gradient.numel() > _SMALL_REPLICA_BUCKET_MAX_NUMEL):
+                self._queue_small_replica_bucket(pending)
+                pending, pending_numel = [], 0
+            if key is not None:
+                pending.append((hsdp_param, gradient))
+                pending_key = key
+                pending_numel += gradient.numel()
+                continue
             if self._should_run_all_reduce(hsdp_param):
                 self._queue_compat_all_reduce(hsdp_param)
             else:
                 need_synchronize = self._apply_pending_unsharded_grad_locally(hsdp_param)
                 self._synchronize_current_stream_if_needed(need_synchronize)
+        if pending:
+            self._queue_small_replica_bucket(pending)
+
+    def _small_replica_bucket_key(self, param):
+        """Select small, device-resident replicas sharing the exact reduction domain."""
+        if (not self._should_run_all_reduce(param) or getattr(param, "offload_to_cpu", True)
+                or not hasattr(param, "unsharded_group_info")):
+            return None, None
+        gradient = self._get_pending_unsharded_grad(param)
+        if gradient.numel() > _SMALL_REPLICA_MAX_NUMEL or gradient.numel() == 0:
+            return None, gradient
+        info = param.unsharded_group_info
+        if info.rank_size <= 1:
+            return None, gradient
+        dtype = param.reduce_dtype if isinstance(param.reduce_dtype, ms.Type) else gradient.dtype
+        return (info.group, info.rank_size, dtype, gradient.device), gradient
+
+    def _queue_small_replica_bucket(self, entries: list) -> None:
+        """Keep singleton behavior and preserve each parameter's scaling before packing."""
+        if len(entries) == 1:
+            self._queue_compat_all_reduce(entries[0][0])
+            return
+        bucket = _SmallReplicaAllReduce(entries, self._resolve_reduce_op())
+        MindSporeHSDPStateV2.pre_small_replica_buckets.append(bucket)
 
     def _drain_reduce_scatter_params(self) -> bool:
         """Wait pending reduce-scatter ops and apply sharded grads."""
@@ -371,7 +448,7 @@ class MindSporeHSDPStateV2(HSDPState):
         need_synchronize = self._drain_reduce_scatter_params()
         self._synchronize_current_stream_if_needed(need_synchronize)
 
-    def reduce_params(self):
+    def reduce_params(self) -> None:
         """Apply reduced gradients from pre-staged all-reduce queues (aligned with Torch).
 
         Drains ``pre_all_reduce_params`` and ``pre_direct_all_reduce_grads``. For
@@ -402,6 +479,8 @@ class MindSporeHSDPStateV2(HSDPState):
                 if reduced_grad.dtype != target_grad.dtype:
                     reduced_grad = reduced_grad.to(target_grad.dtype)
                 copy_without_bumping_version(target_grad, reduced_grad)
+        while MindSporeHSDPStateV2.pre_small_replica_buckets:
+            MindSporeHSDPStateV2.pre_small_replica_buckets.pop(0).wait_and_apply()
         self._synchronize_current_stream_if_needed(need_synchronize)
 
     def _wait_prev_reduce_scatter(self) -> List:

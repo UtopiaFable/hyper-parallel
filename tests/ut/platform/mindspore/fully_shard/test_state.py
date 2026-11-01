@@ -80,6 +80,121 @@ def _make_state():
     return state
 
 
+def _small_replica(values, group="replicas", factor=0.5, dtype=ms.float32):
+    """Create a replicated parameter with real CPU tensor gradients."""
+    grad = ms.Tensor(np.asarray(values, dtype=np.float32), dtype=dtype)
+    return SimpleNamespace(
+        _unsharded_param=True, unsharded_param=SimpleNamespace(grad=grad),
+        sharded_param=SimpleNamespace(requires_grad=True),
+        unsharded_grad_data=grad, unsharded_accumulated_grad=None,
+        unsharded_accumulated_grad_data=None, reduce_dtype=ms.float32,
+        orig_dtype=dtype, gradient_scaling_factor=factor, dp_size=2,
+        offload_to_cpu=False, unsharded_group_info=SimpleNamespace(group=group, rank_size=2),
+        all_reduce_grad=MagicMock(), apply_reduced_grad=MagicMock(return_value=False),
+        to_accumulated_grad_if_needed=MagicMock(),
+    )
+
+
+class TestSmallReplicaBuckets(MindSporeFullyShardUnitTest):
+    """Check real packing, deferred completion and replica fallback semantics."""
+
+    def test_small_gradients_share_one_waited_collective(self) -> None:
+        """Pack scalar/bias grads, scale once and wait before writeback."""
+        state = _make_state()
+        params = [_small_replica([2.]), _small_replica(np.arange(24)), _small_replica([6.], factor=0.25)]
+        state.replicate_params = params
+        handle = MagicMock()
+        # The Ascend wheel's CPU in-place multiply is unreliable; preserve numeric
+        # scaling here and exercise the real operation in the distributed NPU case.
+        with patch.object(state_mod.dist, "all_reduce", return_value=handle) as reduce, \
+                patch.object(state_mod, "apply_gradient_scaling_factor",
+                             side_effect=lambda grad, factor: grad.copy_(grad * factor)) as scale:
+            state._queue_replicate_params_allreduce()
+            self.assertEqual(reduce.call_count, 1)
+            packed = reduce.call_args.args[0]
+            np.testing.assert_array_equal(packed.asnumpy(), np.r_[1., np.arange(24)*0.5, 1.5])
+            for param in params:
+                param.apply_reduced_grad.assert_not_called()
+                param.all_reduce_grad.assert_not_called()
+            self.assertEqual(scale.call_count, 3)
+            handle.wait.side_effect = lambda: packed.copy_(packed * 2)
+            state.reduce_params()
+        handle.wait.assert_called_once()
+        for param, expected in zip(params, [[2.], np.arange(24), [3.]]):
+            output, dtype = param.apply_reduced_grad.call_args.args
+            np.testing.assert_array_equal(output.asnumpy(), expected)
+            self.assertEqual(dtype, param.orig_dtype)
+
+    def test_groups_and_large_parameters_keep_separate_collectives(self) -> None:
+        """Do not merge another group or delay a large parameter behind a bucket."""
+        state = _make_state()
+        big = _small_replica(np.ones(128))
+        state.replicate_params = [_small_replica([1.]), _small_replica([2.]), big,
+                                  _small_replica([3.], group="other"), _small_replica([4.], group="other")]
+        with patch.object(state, "_queue_compat_all_reduce") as fallback, \
+                patch.object(state_mod.dist, "all_reduce", return_value=MagicMock()) as reduce:
+            state._queue_replicate_params_allreduce()
+            self.assertEqual([c.kwargs['group'] for c in reduce.call_args_list], ['replicas', 'other'])
+            fallback.assert_called_once_with(big)
+            state.reduce_params()
+
+    def test_accumulation_defers_every_replica_until_sync(self) -> None:
+        """An unsynchronized microbatch must not scale or reduce local contributions."""
+        state = _make_state()
+        state.requires_all_reduce = False
+        state.replicate_params = [_small_replica([2.]), _small_replica([4.])]
+        with patch.object(state_mod.dist, "all_reduce") as reduce:
+            state._queue_replicate_params_allreduce()
+            reduce.assert_not_called()
+        for param, value in zip(state.replicate_params, [2., 4.]):
+            param.to_accumulated_grad_if_needed.assert_called_once()
+            param.apply_reduced_grad.assert_not_called()
+            self.assertEqual(param.unsharded_grad_data.item(), value)
+
+    def test_singletons_offload_and_missing_gradients_keep_fallbacks(self) -> None:
+        """Retain original handling for inactive, offloaded and singleton replicas."""
+        state = _make_state()
+        first, offload, missing = [_small_replica([1.]) for _ in range(3)]
+        offload.offload_to_cpu = True
+        missing.unsharded_param.grad = None
+        state.replicate_params = [first, offload, missing]
+        with patch.object(state, "_queue_compat_all_reduce") as fallback, \
+                patch.object(state_mod.dist, "all_reduce") as reduce:
+            state._queue_replicate_params_allreduce()
+            self.assertEqual(fallback.call_args_list, [call(first), call(offload)])
+            reduce.assert_not_called()
+
+    def test_average_reduction_uses_accumulated_gradients_and_reduce_dtype(self) -> None:
+        """Cast accumulated BF16 gradients to the reduction dtype without double averaging."""
+        state = _make_state()
+        state.reduce_op_type = ops.ReduceOp.AVG
+        params = [_small_replica([1.], factor=None, dtype=ms.bfloat16) for _ in range(2)]
+        for param in params:
+            param.unsharded_accumulated_grad = ms.Tensor([6.], ms.bfloat16)
+            param.unsharded_accumulated_grad_data = param.unsharded_accumulated_grad
+        state.replicate_params = params
+        with patch.object(state_mod.dist, "all_reduce", return_value=None) as reduce:
+            state._queue_replicate_params_allreduce()
+            packed = reduce.call_args.args[0]
+            self.assertEqual(packed.dtype, ms.float32)
+            self.assertEqual(reduce.call_args.kwargs['op'], ops.ReduceOp.AVG)
+            np.testing.assert_array_equal(packed.asnumpy(), [6., 6.])
+            state.reduce_params()
+        for param in params:
+            gradient, dtype = param.apply_reduced_grad.call_args.args
+            np.testing.assert_array_equal(gradient.asnumpy(), [6.])
+            self.assertEqual(dtype, ms.bfloat16)
+
+    def test_bucket_size_is_bounded(self) -> None:
+        """Split long replica lists without exceeding the small-buffer bound."""
+        state = _make_state()
+        state.replicate_params = [_small_replica(np.ones(64), factor=None) for _ in range(66)]
+        with patch.object(state_mod.dist, "all_reduce", return_value=MagicMock()) as reduce:
+            state._queue_replicate_params_allreduce()
+            self.assertEqual([c.args[0].numel() for c in reduce.call_args_list], [4096, 128])
+            state.reduce_params()
+
+
 class FakeParam:
     """Hashable parameter stub that behaves like an uninitialized MindSpore param."""
 
