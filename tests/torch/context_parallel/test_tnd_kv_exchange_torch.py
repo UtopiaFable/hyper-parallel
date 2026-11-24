@@ -23,7 +23,7 @@ from tests.common.mark_utils import arg_mark
 
 from hyper_parallel.core.context_parallel import tnd_kv_exchange as kv
 from hyper_parallel.core.context_parallel.tnd_kv_exchange import (
-    block_views, exchange_tnd_kv, plan_tnd_kv_exchange, reduce_tnd_kv_gradients,
+    block_views, exchange_tnd_kv, bridge_tnd_kv_bank, plan_tnd_kv_exchange, reduce_tnd_kv_gradients,
 )
 
 
@@ -43,11 +43,12 @@ def test_local_only_bank_supports_shared_consumers_and_explicit_kl() -> None:
 
 @pytest.mark.parametrize('ends', [tuple(range(4, 33, 4)), (2, 6, 17, 32, 32),
                                   (12, 16, 20, 24, 28, 32), (32,)])
-@pytest.mark.parametrize('explicit', [False, True])
+@pytest.mark.parametrize('mode', ['autograd', 'cached', 'explicit'])
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
 def test_remote_transport_matches_independent_cpu_collective(
-        monkeypatch: Any, ends: tuple, explicit: bool) -> None:
+        monkeypatch: Any, ends: tuple, mode: str) -> None:
     """Exercise actual pack/unpack and adjoint through a transport-only collective stub."""
+    explicit = mode == "explicit"
     pairs = ((2, 7), (1, 5), (0, 3), (4, 6))
     plans = plan_tnd_kv_exchange(ends, pairs)
     owners = [[token for chunk in pair for token in range(chunk*4, (chunk+1)*4)] for pair in pairs]
@@ -106,7 +107,12 @@ def test_remote_transport_matches_independent_cpu_collective(
             assert not actual.requires_grad
         else:
             local = natural[owners[rank]].clone().requires_grad_()
-            bank = exchange_tnd_kv(local, plan, None)
+            if mode == 'cached':
+                with torch.no_grad():
+                    saved = exchange_tnd_kv(local, plan, None).detach()
+                bank = bridge_tnd_kv_bank(local, saved, plan, None)
+            else:
+                bank = exchange_tnd_kv(local, plan, None)
             torch.testing.assert_close(bank, natural[sorted(wanted[rank])])
             ((bank*(rank+1)).square().sum()+2*bank.sum()).backward()
             actual = local.grad

@@ -177,7 +177,7 @@ def _exchange(parts: list, ref: Any, sends: tuple, receives: tuple, group: Any) 
     return received.reshape((sum(receives),) + tuple(ref.shape[1:])).contiguous()
 
 
-def _sum_segments(segments: list, rows: int, ref: Any) -> Any:
+def _sum_segments(segments: list, rows: int, ref: Any, fp32_accumulation: bool = False) -> Any:
     """Sum overlapping contributions in deterministic consumer-rank order."""
     edges = sorted({0, rows, *(edge for start, tensor in segments
                               for edge in (start, start + tensor.shape[0]))})
@@ -186,9 +186,11 @@ def _sum_segments(segments: list, rows: int, ref: Any) -> Any:
         values = [tensor.narrow(0, start - left, stop - start) for left, tensor in segments
                   if left <= start and stop <= left + tensor.shape[0]]
         value = values[0] if values else _zeros(ref, stop - start)
+        if fp32_accumulation:
+            value = value.float()
         for other in values[1:]:
-            value = value + other
-        parts.append(value)
+            value = value + (other.float() if fp32_accumulation else other)
+        parts.append(value.to(ref.dtype) if fp32_accumulation else value)
     return _cat(parts, ref)
 
 
@@ -209,7 +211,7 @@ def _receive_bank(local: Any, plan: TNDKVRoute, group: Any) -> Any:
     return _cat([tensor for _, tensor in sorted(pieces, key=lambda item: item[0])], local)
 
 
-def _return_gradients(bank_grad: Any, plan: TNDKVRoute, group: Any) -> Any:
+def _return_gradients(bank_grad: Any, plan: TNDKVRoute, group: Any, fp32_accumulation: bool = False) -> Any:
     """Reverse the exact routes, then sum all consumers on each source owner."""
     parts = [bank_grad.narrow(0, target, length) for peer, routes in enumerate(plan.routes_in)
              if peer != plan.rank for _, target, length in routes]
@@ -224,7 +226,7 @@ def _return_gradients(bank_grad: Any, plan: TNDKVRoute, group: Any) -> Any:
             pieces.append((source, tensor))
             if peer != plan.rank:
                 offset += length
-    return _sum_segments(pieces, plan.local_rows, bank_grad)
+    return _sum_segments(pieces, plan.local_rows, bank_grad, fp32_accumulation)
 
 
 class _PartialKV(platform.Function):
@@ -280,12 +282,9 @@ def block_views(bank: Any, plan: TNDKVRoute) -> tuple:
                  for block in plan.blocks)
 
 
-def reduce_tnd_kv_gradients(gradients: tuple, plan: TNDKVRoute, group: Any) -> Any:
-    """Return first-order KL key gradients to owners without recording another graph.
-
-    Already-computed gradients are final first-order values; no higher-order
-    graph is recorded. Automatic first-order consumers use exchange_tnd_kv.
-    """
+def merge_tnd_kv_gradients(gradients: tuple, plan: TNDKVRoute,
+                           fp32_accumulation: bool = False) -> Any:
+    """Merge explicit block gradients into their compact bank without communication."""
     if not gradients or len(gradients) != len(plan.blocks):
         raise ValueError("One explicit gradient is required per nonempty compact Q block.")
     with platform.no_grad():
@@ -295,5 +294,40 @@ def reduce_tnd_kv_gradients(gradients: tuple, plan: TNDKVRoute, group: Any) -> A
             if gradient.ndim < 1 or gradient.shape[0] != stop - start:
                 raise ValueError("KL gradient does not match its compact KV block.")
             pieces.append((_block_offset(block, plan), gradient))
-        bank_grad = _sum_segments(pieces, plan.bank_rows, gradients[0])
-        return _return_gradients(bank_grad, plan, group)
+        return _sum_segments(pieces, plan.bank_rows, gradients[0], fp32_accumulation)
+
+
+def reduce_tnd_kv_gradients(gradients: tuple, plan: TNDKVRoute, group: Any,
+                            fp32_accumulation: bool = False) -> Any:
+    """Return first-order KL key gradients to owners without recording another graph.
+
+    Already-computed gradients are final first-order values; no higher-order
+    graph is recorded. Automatic first-order consumers use exchange_tnd_kv.
+    """
+    with platform.no_grad():
+        bank_grad = merge_tnd_kv_gradients(gradients, plan, fp32_accumulation)
+        return _return_gradients(bank_grad, plan, group, fp32_accumulation)
+
+
+class _CachedBankBridge(platform.Function):
+    """Share forward storage while keeping each consumer's reverse independent."""
+
+    @staticmethod
+    def forward(ctx: Any, local: Any, bank: Any, plan: TNDKVRoute, group: Any) -> Any:
+        """Retain no cache or activation references on the gradient bridge."""
+        del local
+        ctx.plan, ctx.group = plan, group
+        return bank
+
+    @staticmethod
+    def backward(ctx: Any, gradient: Any) -> tuple:  # pylint: disable=arguments-differ
+        """Accumulate source-local contributions in FP32, retaining BF16 wire data."""
+        with platform.no_grad():
+            return _return_gradients(gradient, ctx.plan, ctx.group, True), None, None, None
+
+
+def bridge_tnd_kv_bank(local: Any, bank: Any, plan: TNDKVRoute, group: Any) -> Any:
+    """Attach an independent first-order reverse to an already exchanged, detached bank."""
+    if local.shape[0] != plan.local_rows or bank.shape[0] != plan.bank_rows:
+        raise ValueError("Shared interval KV bank does not match its source and receiver shapes.")
+    return _CachedBankBridge.apply(local, bank, plan, group)
