@@ -110,7 +110,11 @@ def test_indexer_derivatives_receive_the_upstream_loss_scale() -> None:
         return (torch.ones_like(args[2]), 2 * torch.ones_like(args[3]),
                 3 * torch.ones_like(args[4]), torch.tensor([2.]))
 
-    with patch.object(runtime_module.platform.custom_ops,
+    # A separate KI bridge would expose Q/weight projection gradients before
+    # its reverse exchange; FSDP could then enqueue a different collective.
+    with patch.object(runtime_module, 'bridge_tnd_kv_bank',
+                      side_effect=RuntimeError('KL must finish its reverse before returning projection gradients')), \
+         patch.object(runtime_module.platform.custom_ops,
                       'npu_sparse_lightning_indexer_grad_kl_loss', side_effect=derivatives):
         with runtime.scope():
             loss = runtime.indexer_loss(query, key, qi, ki, weights, indices, stats, stats,

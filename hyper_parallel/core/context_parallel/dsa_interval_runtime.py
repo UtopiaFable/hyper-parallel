@@ -25,6 +25,7 @@ from hyper_parallel.platform import get_platform
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.context_parallel.tnd_kv_exchange import (
     plan_tnd_kv_exchange, exchange_tnd_kv, bridge_tnd_kv_bank, block_views, merge_tnd_kv_gradients,
+    reduce_tnd_kv_bank_gradients,
 )
 
 platform = get_platform()
@@ -53,11 +54,13 @@ class _IntervalKL(platform.Function):
     @staticmethod
     def forward(ctx: Any, state: Any, query: Any, key: Any, qi: Any, ki: Any, weights: Any,
                 indices: Any, maximum: Any, summation: Any, scale: float, qr: Any, kr: Any) -> Any:
-        """Compute compact derivatives; the key bank bridge applies the true loss scaling."""
+        """Retain compact derivatives and the immutable route for one backward boundary."""
         with platform.no_grad():
-            result = state.runtime._kl(state, query, key, qi, ki, weights, indices, maximum,
+            bank = state.runtime._bank(state, "indexer_k", ki)
+            result = state.runtime._kl(state, query, key, qi, bank, weights, indices, maximum,
                                        summation, scale, qr, kr)
         ctx.save_for_backward(*result[:3])
+        ctx.plan, ctx.group = state.plan, state.runtime.group
         return result[3][0]
 
     @staticmethod
@@ -68,6 +71,11 @@ class _IntervalKL(platform.Function):
             dqi.mul_(gradient)
             dki.mul_(gradient)
             dw.mul_(gradient)
+            # Do not expose Q/weight projection gradients to FSDP while a
+            # separate autograd branch still owes the sequence-group exchange.
+            # Applying the receiver's scalar before this return preserves the
+            # adjoint even when different ranks have different loss weights.
+            dki = reduce_tnd_kv_bank_gradients(dki, ctx.plan, ctx.group, True)
             return (None, None, None, dqi, dki, dw, None, None, None, None, None, None)
 
 
@@ -193,10 +201,9 @@ class DSAIntervalRuntime:
         query, key, qi, ki, weights, indices, maximum, summation, qr, kr = map(
             _local, (query, key, qi, ki, weights, indices, maximum, summation, qr, kr))
         state = self._state(query, qmeta, kmeta)
-        # Keep the bank as a real autograd input. Its independent bridge returns
-        # gradients only after the receiver's upstream scalar has been applied.
-        key_bank = self._bank(state, "indexer_k", ki, True)
-        return _IntervalKL.apply(state, query, key, qi, key_bank, weights, indices,
+        # The complete KI adjoint belongs to the KL boundary, so parameter
+        # hooks only see its three projection gradients after the reverse.
+        return _IntervalKL.apply(state, query, key, qi, ki, weights, indices,
                                  maximum, summation, scale, qr, kr)
 
     def _kl(self, state: _Call, query: Any, key: Any, qi: Any, ki: Any, weights: Any, indices: Any,

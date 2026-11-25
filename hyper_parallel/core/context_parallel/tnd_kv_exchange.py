@@ -309,6 +309,19 @@ def reduce_tnd_kv_gradients(gradients: tuple, plan: TNDKVRoute, group: Any,
         return _return_gradients(bank_grad, plan, group, fp32_accumulation)
 
 
+def reduce_tnd_kv_bank_gradients(gradient: Any, plan: TNDKVRoute, group: Any,
+                                fp32_accumulation: bool = False) -> Any:
+    """Return a merged bank gradient before exposing dependent parameter gradients.
+
+    Custom backward functions call this after applying their upstream scalar,
+    without adding a separate autograd node for the reverse collective.
+    """
+    if gradient.ndim < 1 or gradient.shape[0] != plan.bank_rows:
+        raise ValueError("Explicit KV bank gradient does not match the receiver interval union.")
+    with platform.no_grad():
+        return _return_gradients(gradient, plan, group, fp32_accumulation)
+
+
 class _CachedBankBridge(platform.Function):
     """Share forward storage while keeping each consumer's reverse independent."""
 
