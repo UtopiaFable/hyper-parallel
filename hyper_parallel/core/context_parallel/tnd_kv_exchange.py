@@ -20,13 +20,24 @@ compact document ends. It is not a full-sequence replicated tensor.
 """
 from dataclasses import dataclass
 from functools import lru_cache
+from hashlib import sha256
+import json
+import logging
 from numbers import Integral
+import os
+from threading import Lock
 from typing import Any, Sequence
 
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.shard.ops.tnd_kv_plan import plan_tnd_kv
 
 platform = get_platform()
+_TRACE_ENABLED = os.environ.get("HP_TND_KV_TRACE", "0") == "1"
+_TRACE_START = int(os.environ.get("HP_TND_KV_TRACE_START", "1"))
+_TRACE_END = int(os.environ.get("HP_TND_KV_TRACE_END", "0"))
+_TRACE_COUNTERS = {}
+_TRACE_LOCK = Lock()
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -48,6 +59,7 @@ class TNDKVRoute:
     send_rows: tuple
     recv_rows: tuple
     global_remote_rows: int
+    document_ends: tuple = ()
 
     @property
     def bank_rows(self) -> int:
@@ -143,7 +155,7 @@ def _plan_tnd_kv_exchange(ends: tuple, pairs: tuple) -> tuple:
         sends = tuple(sum(n for _, _, n in row) if dst != rank else 0 for dst, row in enumerate(outgoing))
         receives = tuple(sum(n for _, _, n in row) if src != rank else 0 for src, row in enumerate(incoming))
         result.append(TNDKVRoute(rank, full_len, 2 * width, pairs, blocks[rank], unions[rank],
-                                 outgoing, incoming, sends, receives, global_rows))
+                                 outgoing, incoming, sends, receives, global_rows, ends))
     return tuple(result)
 
 
@@ -157,7 +169,40 @@ def _cat(parts: list, ref: Any) -> Any:
     return platform.cat(parts, dim=0) if parts else _zeros(ref, 0)
 
 
-def _exchange(parts: list, ref: Any, sends: tuple, receives: tuple, group: Any) -> Any:
+@lru_cache(maxsize=128)
+def _trace_digest(values: tuple) -> str:
+    """Fingerprint immutable host geometry without reading any device tensor."""
+    return sha256(repr(values).encode("utf-8")).hexdigest()[:32]
+
+
+def _trace_exchange(plan: TNDKVRoute, direction: str, group: Any, ref: Any,
+                    columns: int, packed_rows: int, sends: tuple, receives: tuple) -> Any:
+    """Record actual element splits; host return does not imply device completion."""
+    key = (str(group), plan.rank)
+    with _TRACE_LOCK:
+        sequence = _TRACE_COUNTERS.get(key, 0) + 1
+        _TRACE_COUNTERS[key] = sequence
+    if sequence < _TRACE_START or (_TRACE_END and sequence > _TRACE_END):
+        return None
+    if len(sends) != len(plan.pairs) or len(receives) != len(plan.pairs) or sum(sends) != packed_rows:
+        raise ValueError("Traced interval KV buffer and per-peer row counts disagree.")
+    record = {
+        "event": "enter", "group": str(group), "sequence": sequence,
+        "global_rank": os.environ.get("RANK_ID", os.environ.get("RANK")),
+        "rank": plan.rank, "world": len(plan.pairs), "direction": direction,
+        "columns": columns, "dtype": str(ref.dtype), "full_rows": plan.full_len,
+        "ends_digest": _trace_digest(plan.document_ends), "pairs_digest": _trace_digest(plan.pairs),
+        "owned_chunks": plan.pairs[plan.rank], "bank_intervals": plan.intervals,
+        "send_counts": [count * columns for count in sends],
+        "recv_counts": [count * columns for count in receives],
+        "input_elements": packed_rows * columns, "output_elements": sum(receives) * columns,
+    }
+    _LOGGER.warning("TND_KV_TRACE %s", json.dumps(record, separators=(",", ":")))
+    return {name: record[name] for name in ("group", "sequence", "rank", "direction")}
+
+
+def _exchange(parts: list, ref: Any, sends: tuple, receives: tuple, group: Any,
+              plan: TNDKVRoute, direction: str) -> Any:
     """Exchange a 1-D buffer with splits expressed in flattened element counts.
 
     MindSpore requires 1-D inputs and element counts; Torch accepts N-D inputs
@@ -168,12 +213,16 @@ def _exchange(parts: list, ref: Any, sends: tuple, receives: tuple, group: Any) 
     columns = 1
     for dim in ref.shape[1:]:
         columns *= dim
+    trace = (_trace_exchange(plan, direction, group, ref, columns, packed.shape[0], sends, receives)
+             if _TRACE_ENABLED else None)
     received = platform.differentiable_all_to_all_single_async(
         packed.reshape(-1), [n * columns for n in sends], [n * columns for n in receives], group)
     # This read resolves the async handle before any packing/scattering consumer.
     # Some backends expose a one-element allocation for an empty receive.
     # Resolve the collective first, then discard that storage-only sentinel.
     received = received.reshape(-1).narrow(0, 0, sum(receives) * columns)
+    if trace is not None:
+        _LOGGER.warning("TND_KV_TRACE %s", json.dumps({**trace, "event": "host_return"}))
     return received.reshape((sum(receives),) + tuple(ref.shape[1:])).contiguous()
 
 
@@ -198,7 +247,7 @@ def _receive_bank(local: Any, plan: TNDKVRoute, group: Any) -> Any:
     """Send requested source fragments and assemble a natural-order compact bank."""
     parts = [local.narrow(0, start, length) for peer, routes in enumerate(plan.routes_out)
              if peer != plan.rank for start, _, length in routes]
-    remote = (_exchange(parts, local, plan.send_rows, plan.recv_rows, group)
+    remote = (_exchange(parts, local, plan.send_rows, plan.recv_rows, group, plan, "forward")
               if plan.global_remote_rows else None)
     pieces = []
     offset = 0
@@ -215,7 +264,7 @@ def _return_gradients(bank_grad: Any, plan: TNDKVRoute, group: Any, fp32_accumul
     """Reverse the exact routes, then sum all consumers on each source owner."""
     parts = [bank_grad.narrow(0, target, length) for peer, routes in enumerate(plan.routes_in)
              if peer != plan.rank for _, target, length in routes]
-    remote = (_exchange(parts, bank_grad, plan.recv_rows, plan.send_rows, group)
+    remote = (_exchange(parts, bank_grad, plan.recv_rows, plan.send_rows, group, plan, "backward")
               if plan.global_remote_rows else None)
     pieces = []
     offset = 0

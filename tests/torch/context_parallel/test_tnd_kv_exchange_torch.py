@@ -14,6 +14,7 @@
 # ============================================================================
 """Torch autograd coverage of the platform-neutral zero-communication path."""
 from dataclasses import replace
+import json
 from typing import Any
 
 import pytest
@@ -44,12 +45,17 @@ def test_local_only_bank_supports_shared_consumers_and_explicit_kl() -> None:
 
 @pytest.mark.parametrize('ends', [tuple(range(4, 33, 4)), (2, 6, 17, 32, 32),
                                   (12, 16, 20, 24, 28, 32), (32,)])
-@pytest.mark.parametrize('mode', ['autograd', 'cached', 'explicit', 'bank'])
+@pytest.mark.parametrize('mode', ['autograd', 'cached', 'explicit', 'bank', 'trace'])
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
 def test_remote_transport_matches_independent_cpu_collective(
-        monkeypatch: Any, ends: tuple, mode: str) -> None:
+        monkeypatch: Any, caplog: Any, ends: tuple, mode: str) -> None:
     """Exercise actual pack/unpack and adjoint through a transport-only collective stub."""
     explicit = mode in ("explicit", "bank")
+    if mode == 'trace':
+        monkeypatch.setattr(kv, '_TRACE_ENABLED', True)
+        monkeypatch.setattr(kv, '_TRACE_COUNTERS', {})
+        monkeypatch.setattr(kv, '_TRACE_START', 1)
+        monkeypatch.setattr(kv, '_TRACE_END', 0)
     pairs = ((2, 7), (1, 5), (0, 3), (4, 6))
     plans = plan_tnd_kv_exchange(ends, pairs)
     owners = [[token for chunk in pair for token in range(chunk*4, (chunk+1)*4)] for pair in pairs]
@@ -125,6 +131,21 @@ def test_remote_transport_matches_independent_cpu_collective(
             [token in wanted[peer] for token in range(32)]).unsqueeze(1) for peer in range(4))
         torch.testing.assert_close(actual, expected[owners[rank]])
         assert len(calls) == (int(plan.global_remote_rows > 0)*(1 if explicit else 2))
+        if mode == 'trace':
+            events = [json.loads(record.getMessage().split('TND_KV_TRACE ', 1)[1])
+                      for record in caplog.records if 'TND_KV_TRACE ' in record.getMessage()]
+            entries = [event for event in events if event['rank'] == rank and event['event'] == 'enter']
+            assert len(entries) == len(calls)
+            for sequence, event in enumerate(entries, 1):
+                assert event['sequence'] == sequence
+                assert event['direction'] == ('forward' if sequence == 1 else 'backward')
+                expected_sends = plan.send_rows if sequence == 1 else plan.recv_rows
+                expected_receives = plan.recv_rows if sequence == 1 else plan.send_rows
+                assert event['send_counts'] == [count*3 for count in expected_sends]
+                assert event['recv_counts'] == [count*3 for count in expected_receives]
+                assert event['input_elements'] == sum(event['send_counts'])
+                assert event['output_elements'] == sum(event['recv_counts'])
+                assert len(event['ends_digest']) == len(event['pairs_digest']) == 32
 
 
 @pytest.mark.parametrize('explicit', [False, True])
