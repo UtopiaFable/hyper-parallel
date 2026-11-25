@@ -103,6 +103,10 @@ def test_indexer_derivatives_receive_the_upstream_loss_scale() -> None:
 
     def derivatives(*args: object) -> tuple:
         """Return independently known projection gradients for each compact block."""
+        # The KL backend takes host IntArray attributes. Reusing the selector's
+        # device metadata here would make MindSpore call Tensor.asnumpy().
+        assert isinstance(args[11], tuple) and args[11] == (4,)
+        assert isinstance(args[12], tuple) and args[12] == (4,)
         return (torch.ones_like(args[2]), 2 * torch.ones_like(args[3]),
                 3 * torch.ones_like(args[4]), torch.tensor([2.]))
 

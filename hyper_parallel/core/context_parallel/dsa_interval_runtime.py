@@ -207,12 +207,17 @@ class DSAIntervalRuntime:
         index_keys = block_views(ki, state.plan)
         results = []
         width = state.plan.local_rows // 2
-        for slot, (cq, ck) in enumerate(state.metadata):
+        for slot, block in enumerate(state.plan.blocks):
             results.append(platform.custom_ops.npu_sparse_lightning_indexer_grad_kl_loss(
                 query.narrow(0, slot*width, width), keys[slot], qi.narrow(0, slot*width, width),
                 index_keys[slot], weights.narrow(0, slot*width, width), indices.narrow(0, slot*width, width),
                 maximum.narrow(1, slot*width, width), summation.narrow(1, slot*width, width), scale,
-                qr.narrow(0, slot*width, width), ropes[slot], cq, ck, "TND", 3, _MAX_TOKENS, _MAX_TOKENS))
+                # KL consumes host IntArray attributes, unlike the selector's
+                # device length tensors. Keep its immutable host coordinates:
+                # a reused Tensor may have moved to Ascend, making the backend
+                # convert it with asnumpy() in the middle of distributed work.
+                qr.narrow(0, slot*width, width), ropes[slot], block.query_ends, block.key_ends,
+                "TND", 3, _MAX_TOKENS, _MAX_TOKENS))
         dki = merge_tnd_kv_gradients(tuple(row[1] for row in results), state.plan, True)
         return (platform.cat([row[0] for row in results], dim=0), dki,
                 platform.cat([row[2] for row in results], dim=0), results[0][3] + results[1][3])
