@@ -14,7 +14,7 @@
 # ============================================================================
 """MindSpore platform api"""
 from datetime import timedelta
-from typing import Any, Optional, Union
+from typing import Any, Optional, Sequence, Union
 import dataclasses
 from collections import OrderedDict
 
@@ -444,9 +444,9 @@ class _MSAsyncA2ALazyBwd(_Function):
         """
         rank_size = get_group_size(group)
         # Positional args follow the MS auto-generated primitive signature:
-        # ``(input, group, send_splits, recv_splits, rank_size, block)``.
-        # ``block=False`` selects the async path; the handle is returned in
-        # the raw tuple and unpacked by ``_deal_comm_outputs`` below.
+        # ``(input, group, send_splits, recv_splits, rank_size, split_sizes_empty)``.
+        # False selects variable splits, not blocking behavior. The generated
+        # primitive's additional async_op argument defaults to True.
         raw = inner_comm_all_to_all_v_op(
             flat_input, group, list(send_splits), list(recv_splits), rank_size,
             False,
@@ -1408,6 +1408,51 @@ class MindSporePlatform(Platform):
     @staticmethod
     def all_to_all_single(input_tensor, output_shape, group, async_op=False):
         return _mindspore_all_to_all_single(input_tensor, output_shape, group, async_op=async_op)
+
+    @staticmethod
+    def differentiable_all_to_all_single(input_tensor: Tensor, input_splits: Sequence[int],
+                                         output_splits: Sequence[int], group: Optional[str]) -> Tensor:
+        """Use the native synchronous variable-split primitive with row-count splits.
+
+        Unlike the explicit async path, the native operator inserts its own
+        wait before returning a plain tensor; no AsyncCollectiveTensor is
+        created. Native primitive bprop supplies the reverse for ordinary
+        autograd callers. Counts for N-D tensors are rows, matching Torch.
+
+        Args:
+            input_tensor: Local input with the token rows on dim 0.
+            input_splits: Number of rows sent to each group rank.
+            output_splits: Number of rows received from each group rank.
+            group: Communication group, or None for the world group.
+
+        Returns:
+            A plain tensor with sum(output_splits) rows.
+
+        Raises:
+            ValueError: If dimensions or per-rank counts disagree.
+        """
+        if input_tensor.ndim < 1:
+            raise ValueError("Synchronous all-to-all requires a tensor with at least one dimension.")
+        group = GlobalComm.WORLD_COMM_GROUP if group is None else group
+        size = get_group_size(group)
+        splits = (input_splits, output_splits)
+        if any(len(values) != size or any(isinstance(value, bool)
+                                         or not isinstance(value, (int, np.integer)) or value < 0
+                                         for value in values) for values in splits):
+            raise ValueError("Synchronous all-to-all requires one nonnegative integer split per rank.")
+        if sum(input_splits) != input_tensor.shape[0]:
+            raise ValueError("Synchronous all-to-all input rows must equal the sum of input_splits.")
+        columns = 1
+        for dimension in input_tensor.shape[1:]:
+            columns *= dimension
+        sends = [int(value) * columns for value in input_splits]
+        receives = [int(value) * columns for value in output_splits]
+        raw = inner_comm_all_to_all_v_op(input_tensor.reshape(-1), group, sends, receives, size,
+                                        False, async_op=False)
+        output, _ = comm_func._deal_dist_comm_outputs(raw, False)  # pylint: disable=protected-access
+        # Empty-receive sentinels are storage only, not logical output rows.
+        return output.reshape(-1)[:sum(receives)].reshape(
+            (sum(output_splits),) + tuple(input_tensor.shape[1:]))
 
     @staticmethod
     def differentiable_async_allgather_wait(x, work, out_perm, group, world_size, gather_dim,

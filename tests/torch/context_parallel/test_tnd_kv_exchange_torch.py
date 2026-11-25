@@ -45,7 +45,7 @@ def test_local_only_bank_supports_shared_consumers_and_explicit_kl() -> None:
 
 @pytest.mark.parametrize('ends', [tuple(range(4, 33, 4)), (2, 6, 17, 32, 32),
                                   (12, 16, 20, 24, 28, 32), (32,)])
-@pytest.mark.parametrize('mode', ['autograd', 'cached', 'explicit', 'bank', 'trace'])
+@pytest.mark.parametrize('mode', ['autograd', 'cached', 'explicit', 'bank', 'trace', 'native_sync'])
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
 def test_remote_transport_matches_independent_cpu_collective(
         monkeypatch: Any, caplog: Any, ends: tuple, mode: str) -> None:
@@ -107,6 +107,12 @@ def test_remote_transport_matches_independent_cpu_collective(
             return torch.cat(receive_data)
 
         monkeypatch.setattr(kv.platform, 'differentiable_all_to_all_single_async', exchange)
+        monkeypatch.setattr(kv.platform, 'differentiable_all_to_all_single', exchange)
+        if mode == 'native_sync':
+            def forbidden_async(*_args: Any) -> Any:
+                """Synchronous Colossal must not enter the explicit async/lazy wrapper."""
+                raise AssertionError('interval transport entered the async wrapper')
+            monkeypatch.setattr(kv.platform, 'differentiable_all_to_all_single_async', forbidden_async)
         if explicit:
             gradients = tuple(torch.full((len(tokens), 3), (rank+1)*(slot+1), dtype=torch.float32, requires_grad=True)
                               for slot, tokens in enumerate(block_tokens[rank]))

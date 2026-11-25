@@ -193,6 +193,7 @@ def _trace_exchange(plan: TNDKVRoute, direction: str, group: Any, ref: Any,
         "global_rank": os.environ.get("RANK_ID", os.environ.get("RANK")),
         "rank": plan.rank, "world": len(plan.pairs), "direction": direction,
         "columns": columns, "dtype": str(ref.dtype), "full_rows": plan.full_len,
+        "transport": "native_sync",
         "ends_digest": _trace_digest(plan.document_ends), "pairs_digest": _trace_digest(plan.pairs),
         "owned_chunks": plan.pairs[plan.rank], "bank_intervals": plan.intervals,
         "send_counts": [count * columns for count in sends],
@@ -217,9 +218,9 @@ def _exchange(parts: list, ref: Any, sends: tuple, receives: tuple, group: Any,
         columns *= dim
     trace = (_trace_exchange(plan, direction, group, ref, columns, packed.shape[0], sends, receives)
              if _TRACE_ENABLED else None)
-    received = platform.differentiable_all_to_all_single_async(
+    received = platform.differentiable_all_to_all_single(
         packed.reshape(-1), [n * columns for n in sends], [n * columns for n in receives], group)
-    # This read resolves the async handle before any packing/scattering consumer.
+    # The native synchronous operator owns the stream wait, with no lazy wrapper.
     # Some backends expose a one-element allocation for an empty receive.
     # Resolve the collective first, then discard that storage-only sentinel.
     received = received.reshape(-1).narrow(0, 0, sum(receives) * columns)
