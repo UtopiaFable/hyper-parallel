@@ -138,6 +138,8 @@ def test_remote_transport_matches_independent_cpu_collective(
             assert len(entries) == len(calls)
             for sequence, event in enumerate(entries, 1):
                 assert event['sequence'] == sequence
+                assert isinstance(event['host_time_ns'], int) and event['host_time_ns'] > 0
+                assert isinstance(event['thread'], int) and event['thread'] > 0
                 assert event['direction'] == ('forward' if sequence == 1 else 'backward')
                 expected_sends = plan.send_rows if sequence == 1 else plan.recv_rows
                 expected_receives = plan.recv_rows if sequence == 1 else plan.send_rows

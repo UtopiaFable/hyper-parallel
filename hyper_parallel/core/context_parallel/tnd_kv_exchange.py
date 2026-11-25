@@ -25,7 +25,8 @@ import json
 import logging
 from numbers import Integral
 import os
-from threading import Lock
+from threading import Lock, get_native_id
+from time import time_ns
 from typing import Any, Sequence
 
 from hyper_parallel.platform import get_platform
@@ -187,7 +188,8 @@ def _trace_exchange(plan: TNDKVRoute, direction: str, group: Any, ref: Any,
     if len(sends) != len(plan.pairs) or len(receives) != len(plan.pairs) or sum(sends) != packed_rows:
         raise ValueError("Traced interval KV buffer and per-peer row counts disagree.")
     record = {
-        "event": "enter", "group": str(group), "sequence": sequence,
+        "event": "enter", "host_time_ns": time_ns(), "thread": get_native_id(),
+        "group": str(group), "sequence": sequence,
         "global_rank": os.environ.get("RANK_ID", os.environ.get("RANK")),
         "rank": plan.rank, "world": len(plan.pairs), "direction": direction,
         "columns": columns, "dtype": str(ref.dtype), "full_rows": plan.full_len,
@@ -222,7 +224,8 @@ def _exchange(parts: list, ref: Any, sends: tuple, receives: tuple, group: Any,
     # Resolve the collective first, then discard that storage-only sentinel.
     received = received.reshape(-1).narrow(0, 0, sum(receives) * columns)
     if trace is not None:
-        _LOGGER.warning("TND_KV_TRACE %s", json.dumps({**trace, "event": "host_return"}))
+        _LOGGER.warning("TND_KV_TRACE %s", json.dumps(
+            {**trace, "event": "host_return", "host_time_ns": time_ns(), "thread": get_native_id()}))
     return received.reshape((sum(receives),) + tuple(ref.shape[1:])).contiguous()
 
 
